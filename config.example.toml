@@ -1,0 +1,81 @@
+# Reactor configuration example
+#
+# Copy this file and customize for your Dolt deployment.
+# Reactor watches Dolt databases via MySQL binlog and dispatches
+# reactions when data changes.
+
+[reactor]
+dolt_host = "127.0.0.1"
+dolt_port = 3306
+dolt_user = "root"
+dolt_password = ""
+server_id = 100                    # unique binlog consumer ID
+event_db = "reactor"               # database for reactor_events table
+health_port = 8075                 # HTTP health/status endpoint
+log_level = "INFO"
+watched_databases = ["my_app"]     # empty = watch all databases
+
+# ── Event Classification ──────────────────────────────────────────
+# Map table changes to semantic event types.
+# Each [[classify]] block watches one table in one database.
+
+[[classify]]
+database = "my_app"
+table = "issues"
+id_field = "id"
+insert = "issue.created"
+update = "issue.updated"
+delete = "issue.deleted"
+summary_template = "{event_type}: {title}"
+
+# Sub-classification: override event type based on row data
+[[classify.sub_classify]]
+condition = "issue_type == 'decision'"
+event_type = "decision.created"
+
+# Field-specific update classification
+[[classify.update_fields]]
+field = "status"
+default_event = "issue.status_changed"
+
+[[classify.update_fields.transitions]]
+from = "open"
+to = "in_progress"
+event_type = "issue.claimed"
+
+[[classify.update_fields.transitions]]
+to = "closed"
+event_type = "issue.closed"
+
+[[classify.update_fields]]
+field = "assignee"
+event_type = "issue.assigned"
+
+# ── Reaction Rules ────────────────────────────────────────────────
+# When a classified event matches, execute the listed actions.
+
+[[reactions]]
+event = "issue.created"
+condition = "priority <= 1"
+actions = [
+    { type = "webhook", url = "https://hooks.example.com/urgent", method = "POST" },
+    { type = "log", template = "🔴 P{priority} issue created: {title}" },
+]
+
+[[reactions]]
+event = "issue.closed"
+actions = [
+    { type = "log", template = "✓ Closed: {title}" },
+]
+
+[[reactions]]
+event = "decision.created"
+actions = [
+    { type = "webhook", url = "https://hooks.example.com/decision-needed" },
+]
+
+[[reactions]]
+event = "issue.assigned"
+actions = [
+    { type = "shell", command = "echo 'Assigned {subject_id} to {assignee}'" },
+]
