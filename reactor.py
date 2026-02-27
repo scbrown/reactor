@@ -715,17 +715,18 @@ class Reactor:
         self._health.start()
         self._timer_mgr.start()
 
-        # Resume from last known position
-        last_gtid = self._state.get("last_gtid_set")
+        # Resume from last known position (file + position based, not GTID)
+        last_file = self._state.get("last_binlog_file")
+        last_pos = self._state.get("last_binlog_pos")
         self._log.info("Starting reactor (server_id=%d, dry_run=%s)", self._server_id, self._dry_run)
-        if last_gtid:
-            self._log.info("Resuming from GTID: %s", last_gtid)
+        if last_file and last_pos:
+            self._log.info("Resuming from %s:%s", last_file, last_pos)
         else:
             self._log.info("Starting from current binlog position (no saved state)")
 
         while self._running:
             try:
-                self._stream_loop(last_gtid)
+                self._stream_loop(last_file, int(last_pos) if last_pos else None)
             except KeyboardInterrupt:
                 self._log.info("Shutting down (keyboard interrupt)")
                 break
@@ -739,8 +740,12 @@ class Reactor:
         """Signal the reactor to stop."""
         self._running = False
 
-    def _stream_loop(self, auto_position: str = None):
-        """Connect to binlog and process events in a loop."""
+    def _stream_loop(self, log_file: str = None, log_pos: int = None):
+        """Connect to binlog and process events in a loop.
+
+        Uses COM_BINLOG_DUMP (file+position) instead of COM_BINLOG_DUMP_GTID
+        because Dolt does not support the GTID-based dump protocol.
+        """
         stream_kwargs = {
             "connection_settings": self._conn_settings,
             "server_id": self._server_id,
@@ -748,8 +753,9 @@ class Reactor:
             "resume_stream": True,
             "only_events": [WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent],
         }
-        if auto_position:
-            stream_kwargs["auto_position"] = auto_position
+        if log_file and log_pos:
+            stream_kwargs["log_file"] = log_file
+            stream_kwargs["log_pos"] = log_pos
 
         stream = BinLogStreamReader(**stream_kwargs)
         self._log.info("Connected to binlog stream")
@@ -835,21 +841,25 @@ class Reactor:
         self._dispatcher.dispatch(event)
 
     def _persist_position(self, event):
-        """Save current binlog position for crash recovery."""
-        # BinLogStreamReader tracks GTID internally
-        # We save a marker so we can resume
+        """Save current binlog file+position for crash recovery.
+
+        Uses SHOW MASTER STATUS to get the current position, since Dolt
+        uses file+position based binlog (not GTID dump protocol).
+        """
         try:
             conn = pymysql.connect(**self._conn_settings)
             with conn.cursor() as cur:
                 cur.execute("SHOW MASTER STATUS")
                 row = cur.fetchone()
-                if row and len(row) >= 5 and row[4]:
-                    gtid_set = row[4]
-                    self._state.set("last_gtid_set", gtid_set)
-                    self._last_gtid = gtid_set
+                if row and len(row) >= 2:
+                    log_file = row[0]
+                    log_pos = str(row[1])
+                    self._state.set("last_binlog_file", log_file)
+                    self._state.set("last_binlog_pos", log_pos)
+                    self._last_gtid = f"{log_file}:{log_pos}"
             conn.close()
         except Exception as e:
-            self._log.debug("Could not persist GTID position: %s", e)
+            self._log.debug("Could not persist binlog position: %s", e)
 
     def _shutdown(self):
         """Clean shutdown."""
@@ -862,8 +872,9 @@ class Reactor:
             with conn.cursor() as cur:
                 cur.execute("SHOW MASTER STATUS")
                 row = cur.fetchone()
-                if row and len(row) >= 5 and row[4]:
-                    self._state.set("last_gtid_set", row[4])
+                if row and len(row) >= 2:
+                    self._state.set("last_binlog_file", row[0])
+                    self._state.set("last_binlog_pos", str(row[1]))
             conn.close()
         except Exception:
             pass
