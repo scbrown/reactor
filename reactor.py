@@ -376,6 +376,7 @@ class ReactionDispatcher:
                 "irc": self._action_irc,
                 "create-timer": self._action_create_timer,
                 "cancel-timer": self._action_cancel_timer,
+                "gt-nudge": self._action_gt_nudge,
             }.get(action_type)
 
             if handler:
@@ -626,6 +627,42 @@ class ReactionDispatcher:
         timer_type = action.get("timer_type")
         self._timer_mgr.cancel_timer(subject_id, timer_type)
         self._log.info("Timer cancelled: %s for %s", timer_type or "all", subject_id)
+
+    # --- Action: gt-nudge (via gt-relay on luvu) ---
+
+    def _action_gt_nudge(self, action: dict, event: dict):
+        """Nudge an agent via gt-relay HTTP endpoint."""
+        relay_url = self._config.get("dispatch", {}).get(
+            "gt_relay_url", "http://192.168.4.187:8076"
+        )
+        target = self._interpolate(action.get("target", "{assignee}"), event)
+        message = self._interpolate(action.get("template", "{summary}"), event)
+        mode = action.get("mode", "queue")
+
+        if not target or target.startswith("{"):
+            self._log.debug("gt-nudge: no target resolved, skipping")
+            return
+
+        body = json.dumps({
+            "target": target,
+            "message": message,
+            "mode": mode,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            f"{relay_url}/nudge", data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read())
+                if result.get("ok"):
+                    self._log.info("gt-nudge → %s: %s", target, message[:60])
+                else:
+                    self._log.error("gt-nudge %s failed: %s", target, result.get("stderr", "")[:100])
+        except urllib.error.URLError as e:
+            self._log.error("gt-nudge failed (target=%s): %s", target, e)
 
     # --- Action: webhook (generic) ---
 
