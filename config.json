@@ -9,7 +9,9 @@
         "state_table": "reactor_state",
         "timer_table": "reactor_timers",
         "health_port": 8075,
+        "mode": "poll",
         "poll_interval": 5,
+        "binlog_server_id": 100,
         "log_level": "INFO",
         "watched_databases": [
             "my_database"

@@ -102,7 +102,9 @@ DEFAULT_CONFIG = {
         "state_table": "reactor_state",
         "timer_table": "reactor_timers",
         "health_port": 8075,
+        "mode": "poll",
         "poll_interval": 5,
+        "binlog_server_id": 100,
         "log_level": "INFO",
         "watched_databases": [],
     },
@@ -1146,6 +1148,7 @@ class Reactor:
         }
         self._event_db = rc.get("event_db", "reactor")
         self._watched_dbs = set(rc.get("watched_databases", []))
+        self._mode = rc.get("mode", "poll")
 
         # Components
         self._schema = SchemaMapper(self._conn_settings)
@@ -1160,16 +1163,149 @@ class Reactor:
         self._health = HealthServer(rc.get("health_port", 8075), self)
 
     def run(self):
-        """Main event loop — poll dolt_log for new commits and process diffs.
-
-        Uses Dolt's dolt_log + dolt_diff system tables instead of binlog.
-        This is more reliable than binlog streaming which can crash Dolt on
-        large databases.
-        """
+        """Main event loop — dispatches to poll or binlog mode based on config."""
         self._running = True
         self._health.start()
         self._timer_mgr.start()
 
+        if self._mode == "binlog":
+            self._run_binlog()
+        else:
+            self._run_poll()
+
+    def _run_binlog(self):
+        """Binlog streaming mode — consume MySQL binlog events from Dolt.
+
+        Requires Dolt with log_bin=1, gtid_mode=ON, and pymysqlreplication.
+        Falls back to poll mode if binlog is unavailable.
+        """
+        if BinLogStreamReader is None:
+            self._log.error("pymysqlreplication not installed — falling back to poll mode")
+            self._mode = "poll"
+            self._run_poll()
+            return
+
+        rc = self._config.get("reactor", {})
+        server_id = rc.get("binlog_server_id", 100)
+
+        # Build watched tables set for fast lookup: (database, table)
+        watched = set()
+        for rule in self._config.get("classify", []):
+            watched.add((rule["database"], rule["table"]))
+
+        # Check binlog is enabled on Dolt
+        try:
+            conn = pymysql.connect(**self._conn_settings)
+            with conn.cursor() as cur:
+                cur.execute("SELECT @@log_bin, @@server_uuid")
+                log_bin, server_uuid = cur.fetchone()
+            conn.close()
+        except Exception as e:
+            self._log.error("Failed to check binlog status: %s — falling back to poll", e)
+            self._mode = "poll"
+            self._run_poll()
+            return
+
+        if not log_bin:
+            self._log.error("Dolt binlog is OFF (@@log_bin=0) — falling back to poll mode")
+            self._mode = "poll"
+            self._run_poll()
+            return
+
+        # Resume from saved GTID position or start fresh
+        saved_gtid = self._state.get("binlog_gtid_position")
+        if saved_gtid:
+            auto_position = saved_gtid
+            self._log.info("Resuming binlog from GTID position: %s", saved_gtid)
+        else:
+            # Start from current position (skip history)
+            auto_position = f"{server_uuid}:1"
+            self._log.info("Starting binlog from server UUID: %s", server_uuid)
+
+        self._log.info("Starting reactor (binlog mode, server_id=%d, dry_run=%s)",
+                       server_id, self._dry_run)
+
+        stream = None
+        events_since_save = 0
+        try:
+            stream = BinLogStreamReader(
+                connection_settings=self._conn_settings,
+                server_id=server_id,
+                blocking=True,
+                auto_position=auto_position,
+                only_events=[WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent],
+                freeze_schema=False,
+            )
+
+            for event in stream:
+                if not self._running:
+                    break
+
+                schema = event.schema.decode() if isinstance(event.schema, bytes) else event.schema
+                table = event.table
+
+                if (schema, table) not in watched:
+                    continue
+
+                columns = self._schema.get_columns(schema, table)
+
+                if isinstance(event, WriteRowsEvent):
+                    for row in event.rows:
+                        values = self._row_to_dict(row["values"], columns)
+                        classified = self._classifier.classify_insert(schema, table, values)
+                        if classified:
+                            self._handle_classified_event(classified)
+                        self._events_processed += 1
+
+                elif isinstance(event, UpdateRowsEvent):
+                    for row in event.rows:
+                        before = self._row_to_dict(row["before_values"], columns)
+                        after = self._row_to_dict(row["after_values"], columns)
+                        classified = self._classifier.classify_update(schema, table, before, after)
+                        if classified:
+                            self._handle_classified_event(classified)
+                        self._events_processed += 1
+
+                elif isinstance(event, DeleteRowsEvent):
+                    for row in event.rows:
+                        values = self._row_to_dict(row["values"], columns)
+                        classified = self._classifier.classify_delete(schema, table, values)
+                        if classified:
+                            self._handle_classified_event(classified)
+                        self._events_processed += 1
+
+                # Persist GTID position every 10 events or on each event
+                events_since_save += 1
+                if events_since_save >= 10:
+                    gtid_set = stream.log_pos  # GTID set string
+                    if gtid_set:
+                        self._state.set("binlog_gtid_position", str(gtid_set))
+                    events_since_save = 0
+
+        except KeyboardInterrupt:
+            self._log.info("Shutting down (keyboard interrupt)")
+        except Exception as e:
+            self._log.error("Binlog stream error: %s — falling back to poll mode", e)
+            if stream:
+                stream.close()
+            self._mode = "poll"
+            self._run_poll()
+            return
+        finally:
+            if stream:
+                # Save final position before closing
+                try:
+                    gtid_set = stream.log_pos
+                    if gtid_set:
+                        self._state.set("binlog_gtid_position", str(gtid_set))
+                except Exception:
+                    pass
+                stream.close()
+
+        self._shutdown()
+
+    def _run_poll(self):
+        """Poll mode — query dolt_log + dolt_diff for changes."""
         poll_interval = self._config.get("reactor", {}).get("poll_interval", 3)
         self._log.info("Starting reactor (poll mode, interval=%ds, dry_run=%s)",
                        poll_interval, self._dry_run)
@@ -1459,7 +1595,7 @@ class Reactor:
             "last_commits": commits,
             "dry_run": self._dry_run,
             "watched_databases": list(self._watched_dbs),
-            "mode": "poll",
+            "mode": self._mode,
         }
 
     def recent_events(self, limit: int = 50) -> list[dict]:
