@@ -4,25 +4,28 @@
         "dolt_port": 3306,
         "dolt_user": "root",
         "dolt_password": "",
-        "server_id": 100,
         "event_db": "reactor",
         "event_table": "reactor_events",
         "state_table": "reactor_state",
         "timer_table": "reactor_timers",
         "health_port": 8075,
+        "poll_interval": 5,
         "log_level": "INFO",
         "watched_databases": [
-            "beads_aegis",
-            "beads_gastown",
-            "beads_goldblum",
-            "beads_gt",
-            "beads_ht",
-            "hq"
+            "my_database"
         ]
     },
+
+    "dispatch": {
+        "message_router_url": "http://localhost:8070/send",
+        "irc_bridge_url": "http://localhost:8099/send",
+        "telegram_bot_token": "",
+        "telegram_chat_id": 0
+    },
+
     "classify": [
         {
-            "database": "beads_aegis",
+            "database": "my_database",
             "table": "issues",
             "id_field": "id",
             "insert": "bead.created",
@@ -55,121 +58,89 @@
             ]
         },
         {
-            "database": "beads_aegis",
+            "database": "my_database",
             "table": "events",
             "id_field": "id",
             "insert": "bead.commented",
             "summary_template": "{event_type}: {issue_id}"
         },
         {
-            "database": "beads_aegis",
+            "database": "my_database",
             "table": "dependencies",
             "id_field": "issue_id",
             "insert": "dep.added",
             "delete": "dep.resolved",
             "summary_template": "{event_type}: {issue_id} depends on {depends_on_id}"
-        },
-        {
-            "database": "beads_aegis",
-            "table": "labels",
-            "id_field": "issue_id",
-            "insert": "label.added",
-            "delete": "label.removed",
-            "summary_template": "{event_type}: {label} on {issue_id}"
-        },
-        {
-            "database": "beads_gastown",
-            "table": "issues",
-            "id_field": "id",
-            "insert": "bead.created",
-            "update": "bead.updated",
-            "summary_template": "{event_type}: {title}",
-            "update_fields": [
-                {
-                    "field": "status",
-                    "default_event": "bead.status_changed",
-                    "transitions": [
-                        {"from": "open", "to": "in_progress", "event_type": "bead.claimed"},
-                        {"to": "closed", "event_type": "bead.closed"}
-                    ]
-                },
-                {
-                    "field": "assignee",
-                    "event_type": "bead.assigned"
-                }
-            ]
-        },
-        {
-            "database": "beads_goldblum",
-            "table": "issues",
-            "id_field": "id",
-            "insert": "bead.created",
-            "update": "bead.updated",
-            "summary_template": "{event_type}: {title}",
-            "update_fields": [
-                {
-                    "field": "status",
-                    "default_event": "bead.status_changed",
-                    "transitions": [
-                        {"from": "open", "to": "in_progress", "event_type": "bead.claimed"},
-                        {"to": "closed", "event_type": "bead.closed"}
-                    ]
-                },
-                {
-                    "field": "assignee",
-                    "event_type": "bead.assigned"
-                }
-            ]
-        },
-        {
-            "database": "hq",
-            "table": "issues",
-            "id_field": "id",
-            "insert": "bead.created",
-            "update": "bead.updated",
-            "summary_template": "{event_type}: {title}",
-            "update_fields": [
-                {
-                    "field": "status",
-                    "default_event": "bead.status_changed",
-                    "transitions": [
-                        {"to": "closed", "event_type": "bead.closed"}
-                    ]
-                }
-            ]
         }
     ],
+
     "reactions": [
         {
+            "_comment": "P0/P1 bead created -> multi-channel notification",
             "event": "bead.created",
-            "condition": "priority <= 1",
+            "condition": "priority is not None and priority <= 1",
             "actions": [
                 {"type": "log", "template": "P{priority} bead created: {title}"},
-                {"type": "webhook", "url": "http://bot.lan:8070/send", "method": "POST"}
+                {"type": "message-router", "group": "ops", "priority": "alert",
+                 "template": "P{priority} bead created: {title} [{subject_id}]"},
+                {"type": "irc", "channel": "#alerts",
+                 "template": "P{priority} bead: {title} [{subject_id}]"}
             ]
         },
         {
+            "_comment": "Bead closed -> announce + cancel stale timer",
             "event": "bead.closed",
             "actions": [
-                {"type": "log", "template": "Closed: {title}"}
+                {"type": "log", "template": "Closed: {title}"},
+                {"type": "message-router", "group": "general", "priority": "info",
+                 "template": "Closed: {title} [{subject_id}]"},
+                {"type": "cancel-timer", "timer_type": "stale_check"}
             ]
         },
         {
+            "_comment": "Bead assigned -> IRC notification",
             "event": "bead.assigned",
             "actions": [
-                {"type": "log", "template": "Assigned {subject_id} to {assignee}"}
+                {"type": "log", "template": "Assigned {subject_id} to {assignee}"},
+                {"type": "irc", "channel": "#general",
+                 "template": "Assigned: {title} -> {assignee} [{subject_id}]"}
             ]
         },
         {
+            "_comment": "Decision created -> Telegram inline keyboard + IRC",
             "event": "decision.created",
             "actions": [
-                {"type": "log", "template": "Decision needed: {title}"}
+                {"type": "log", "template": "Decision needed: {title}"},
+                {"type": "telegram-decision"},
+                {"type": "irc", "channel": "#general",
+                 "template": "Decision needed: {title} [{subject_id}]"}
             ]
         },
         {
+            "_comment": "Dependency resolved -> IRC notification",
             "event": "dep.resolved",
             "actions": [
-                {"type": "log", "template": "Dependency resolved: {issue_id} no longer blocked by {depends_on_id}"}
+                {"type": "log", "template": "Dep resolved: {issue_id} no longer blocked by {depends_on_id}"},
+                {"type": "irc", "channel": "#general",
+                 "template": "Unblocked: {issue_id} (dep {depends_on_id} resolved)"}
+            ]
+        },
+        {
+            "_comment": "Bead claimed -> start 24h stale timer",
+            "event": "bead.claimed",
+            "actions": [
+                {"type": "log", "template": "Claimed: {title} by {actor}"},
+                {"type": "create-timer", "timer_type": "stale_check", "delay_seconds": 86400,
+                 "reaction": {"event_type": "bead.stale"}}
+            ]
+        },
+        {
+            "_comment": "Stale bead (24h in_progress) -> alert",
+            "event": "bead.stale",
+            "actions": [
+                {"type": "log", "template": "Stale 24h: {title} ({assignee})"},
+                {"type": "message-router", "group": "ops", "priority": "alert",
+                 "template": "Stale 24h: {title} ({assignee}) [{subject_id}]"}
             ]
         }
     ]
