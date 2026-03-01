@@ -377,6 +377,7 @@ class ReactionDispatcher:
                 "create-timer": self._action_create_timer,
                 "cancel-timer": self._action_cancel_timer,
                 "gt-nudge": self._action_gt_nudge,
+                "alert-escalate": self._action_alert_escalate,
             }.get(action_type)
 
             if handler:
@@ -664,6 +665,62 @@ class ReactionDispatcher:
         except urllib.error.URLError as e:
             self._log.error("gt-nudge failed (target=%s): %s", target, e)
 
+    # --- Action: alert-escalate (cascading escalation timers) ---
+
+    def _action_alert_escalate(self, action: dict, event: dict):
+        """Create the next escalation timer in the chain.
+
+        When triggered from alert.fired: creates first timer (level 0).
+        When triggered from alert.escalation: creates next timer (level + 1).
+        Stops when escalation chain is exhausted.
+        """
+        if not self._timer_mgr:
+            self._log.error("alert-escalate: no TimerManager")
+            return
+
+        payload = event.get("payload", {})
+        chain = payload.get("escalation_chain", [])
+        current_level = payload.get("escalation_level", 0)
+        fingerprint = event.get("subject_id", "")
+
+        if not chain or not fingerprint:
+            self._log.warning("alert-escalate: missing chain or fingerprint")
+            return
+
+        # For alert.fired: create timer for level 0
+        # For alert.escalation: create timer for level + 1
+        if event["event_type"] == "alert.fired":
+            next_level = 0
+        else:
+            next_level = current_level + 1
+
+        if next_level >= len(chain):
+            self._log.info("alert-escalate: chain exhausted for %s (level %d/%d)",
+                           fingerprint, next_level, len(chain))
+            return
+
+        target = chain[next_level]
+        delay = action.get("delay_seconds",
+                           self._config.get("dispatch", {}).get(
+                               "escalation_timer_seconds", 600))
+
+        # Build timer reaction payload with full context
+        reaction = {
+            "event_type": "alert.escalation",
+            "escalation_target": target,
+            "escalation_level": next_level,
+            "escalation_chain": chain,
+            "alertname": payload.get("alertname", ""),
+            "hostname": payload.get("hostname", ""),
+            "severity": payload.get("severity", ""),
+            "fingerprint": fingerprint,
+            "first_seen": payload.get("first_seen", ""),
+        }
+
+        self._timer_mgr.create_timer(fingerprint, "alert_escalation", delay, reaction)
+        self._log.info("Escalation timer: %s level %d→%s in %ds",
+                       fingerprint, next_level, target, delay)
+
     # --- Action: webhook (generic) ---
 
     def _action_webhook(self, action: dict, event: dict):
@@ -886,6 +943,9 @@ class HealthServer:
                     self._handle_telegram_callback(data)
                 elif self.path == "/callback/irc":
                     self._handle_irc_callback(data)
+                elif self.path == "/event":
+                    result = reactor.inject_external_event(data)
+                    self._respond(200 if result.get("ok") else 400, result)
                 else:
                     self._respond(404, {"error": "not found"})
 
@@ -1310,6 +1370,31 @@ class Reactor:
                     self._handle_classified_event(classified)
 
             self._events_processed += 1
+
+    def inject_external_event(self, data: dict) -> dict:
+        """Inject an externally-sourced event into the reactor pipeline.
+
+        Used by POST /event to accept events from alert-comms-bridge, etc.
+        Returns a result dict with ok status.
+        """
+        event_type = data.get("event_type")
+        subject_id = data.get("subject_id", data.get("fingerprint", ""))
+        if not event_type:
+            return {"ok": False, "error": "event_type required"}
+        if not subject_id:
+            return {"ok": False, "error": "subject_id required"}
+
+        event = {
+            "event_type": event_type,
+            "subject_id": subject_id,
+            "summary": data.get("summary", f"{event_type}: {subject_id}"),
+            "source_db": "external",
+            "source_table": data.get("source", "alert-comms-bridge"),
+            "actor": data.get("actor", "alertmanager"),
+            "payload": data,
+        }
+        self._handle_classified_event(event)
+        return {"ok": True, "event_type": event_type, "subject_id": subject_id}
 
     def stop(self):
         """Signal the reactor to stop."""
