@@ -585,14 +585,28 @@ class ReactionDispatcher:
         timer_type = action.get("timer_type", "generic")
         delay = action.get("delay_seconds", 86400)
 
-        # Build reaction payload — store original event fields for template interpolation
+        # Build reaction payload — store key event fields for template interpolation
+        # when the timer fires. Only copy JSON-safe scalar fields to avoid
+        # datetime serialization errors from Dolt row data.
         reaction = dict(action.get("reaction", {}))
         payload = event.get("payload", {})
         if isinstance(payload, dict):
-            for k, v in payload.items():
-                reaction.setdefault(k, v)
+            # For update events, flatten "after" (current state) into reaction
+            after = payload.get("after")
+            source = after if isinstance(after, dict) else payload
+            for k, v in source.items():
+                if k in ("before", "after"):
+                    continue
+                if isinstance(v, (str, int, float, bool, type(None))):
+                    reaction.setdefault(k, v)
+                elif isinstance(v, datetime.datetime):
+                    reaction.setdefault(k, v.isoformat())
         reaction.setdefault("subject_id", subject_id)
         reaction.setdefault("original_event_type", event["event_type"])
+        # Copy top-level event fields that are useful for templates
+        for field in ("summary", "source_db", "source_table", "actor"):
+            if field in event and isinstance(event[field], str):
+                reaction.setdefault(field, event[field])
 
         self._timer_mgr.create_timer(subject_id, timer_type, delay, reaction)
         self._log.info("Timer created: %s/%s fires in %ds for %s",
