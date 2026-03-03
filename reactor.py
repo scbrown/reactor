@@ -104,6 +104,8 @@ DEFAULT_CONFIG = {
         "health_port": 8075,
         "mode": "poll",
         "poll_interval": 5,
+        "max_commits_per_cycle": 50,
+        "catchup_delay_ms": 100,
         "binlog_server_id": 100,
         "log_level": "INFO",
         "watched_databases": [],
@@ -896,6 +898,20 @@ class StateTracker:
         finally:
             conn.close()
 
+    def get_gtid_executed(self) -> str | None:
+        """Query @@gtid_executed from Dolt to get current GTID set."""
+        conn = pymysql.connect(**self._conn_settings, database=self._database)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT @@gtid_executed")
+                row = cur.fetchone()
+                return row[0] if row else None
+        except Exception as e:
+            self._log.error("Failed to query @@gtid_executed: %s", e)
+            return None
+        finally:
+            conn.close()
+
 
 # ---------------------------------------------------------------------------
 # Health server — lightweight HTTP health check endpoint
@@ -1138,6 +1154,7 @@ class Reactor:
         self._events_dispatched = 0
         self._last_event_time = None
         self._recent_events: list[dict] = []
+        self._catchup_remaining = 0
 
         rc = config.get("reactor", {})
         self._conn_settings = {
@@ -1145,6 +1162,7 @@ class Reactor:
             "port": rc.get("dolt_port", 3306),
             "user": rc.get("dolt_user", "root"),
             "password": rc.get("dolt_password", ""),
+            "charset": "utf8mb4",
         }
         self._event_db = rc.get("event_db", "reactor")
         self._watched_dbs = set(rc.get("watched_databases", []))
@@ -1214,13 +1232,21 @@ class Reactor:
 
         # Resume from saved GTID position or start fresh
         saved_gtid = self._state.get("binlog_gtid_position")
-        if saved_gtid:
+        if saved_gtid and ":" in saved_gtid and "-" in saved_gtid:
+            # Looks like a valid GTID set (uuid:1-N format)
             auto_position = saved_gtid
             self._log.info("Resuming binlog from GTID position: %s", saved_gtid)
         else:
-            # Start from current position (skip history)
-            auto_position = f"{server_uuid}:1"
-            self._log.info("Starting binlog from server UUID: %s", server_uuid)
+            if saved_gtid:
+                self._log.warning("Discarding invalid saved GTID '%s' — not UUID format", saved_gtid)
+            # Start from current executed GTID set, or fall back to server UUID
+            current_gtid = self._state.get_gtid_executed()
+            if current_gtid and ":" in current_gtid:
+                auto_position = current_gtid
+                self._log.info("Starting binlog from current GTID: %s", auto_position)
+            else:
+                auto_position = f"{server_uuid}:1"
+                self._log.info("Starting binlog from server UUID: %s", server_uuid)
 
         self._log.info("Starting reactor (binlog mode, server_id=%d, dry_run=%s)",
                        server_id, self._dry_run)
@@ -1274,12 +1300,12 @@ class Reactor:
                             self._handle_classified_event(classified)
                         self._events_processed += 1
 
-                # Persist GTID position every 10 events or on each event
+                # Persist GTID position every 10 events
                 events_since_save += 1
                 if events_since_save >= 10:
-                    gtid_set = stream.log_pos  # GTID set string
+                    gtid_set = self._state.get_gtid_executed()
                     if gtid_set:
-                        self._state.set("binlog_gtid_position", str(gtid_set))
+                        self._state.set("binlog_gtid_position", gtid_set)
                     events_since_save = 0
 
         except KeyboardInterrupt:
@@ -1293,11 +1319,11 @@ class Reactor:
             return
         finally:
             if stream:
-                # Save final position before closing
+                # Save final GTID position before closing
                 try:
-                    gtid_set = stream.log_pos
+                    gtid_set = self._state.get_gtid_executed()
                     if gtid_set:
-                        self._state.set("binlog_gtid_position", str(gtid_set))
+                        self._state.set("binlog_gtid_position", gtid_set)
                 except Exception:
                     pass
                 stream.close()
@@ -1435,12 +1461,30 @@ class Reactor:
             self._state.set(state_key, head)
             return False
 
-        self._log.info("Found %d new commit(s) in %s", len(new_commits), database)
+        # Rate limiting: cap commits per cycle to prevent Dolt overload
+        rc = self._config.get("reactor", {})
+        max_per_cycle = rc.get("max_commits_per_cycle", 50)
+        catchup_delay_ms = rc.get("catchup_delay_ms", 100)
+        total_pending = len(new_commits)
+        catchup = total_pending > max_per_cycle
+
+        if catchup:
+            self._log.warning(
+                "Catchup mode: %d commits pending in %s, processing %d this cycle",
+                total_pending, database, max_per_cycle)
+            new_commits = new_commits[:max_per_cycle]
+            self._catchup_remaining = total_pending - max_per_cycle
+        else:
+            self._catchup_remaining = 0
+
+        self._log.info("Found %d new commit(s) in %s%s",
+                       len(new_commits), database,
+                       f" ({total_pending - len(new_commits)} deferred)" if catchup else "")
 
         # Process each new commit's diffs
         tables = self._watched_tables.get(database, set())
         prev_commit = last_commit
-        for commit_hash, message, committer, date in new_commits:
+        for i, (commit_hash, message, committer, date) in enumerate(new_commits):
             self._log.info("Processing commit %s: %s (by %s)",
                            commit_hash[:12], message, committer)
             for table in tables:
@@ -1451,7 +1495,11 @@ class Reactor:
                                     database, table, commit_hash[:12], e)
             prev_commit = commit_hash
 
-        # Persist position after processing all new commits
+            # Inter-commit delay during catchup to avoid overloading Dolt
+            if catchup and catchup_delay_ms > 0 and i < len(new_commits) - 1:
+                time.sleep(catchup_delay_ms / 1000.0)
+
+        # Persist position after processing this batch
         self._state.set(state_key, prev_commit)
         return True
 
@@ -1596,6 +1644,7 @@ class Reactor:
             "dry_run": self._dry_run,
             "watched_databases": list(self._watched_dbs),
             "mode": self._mode,
+            "catchup_remaining": self._catchup_remaining,
         }
 
     def recent_events(self, limit: int = 50) -> list[dict]:
@@ -1638,6 +1687,7 @@ class Reactor:
             f"reactor_events_processed_total {self._events_processed}",
             f"reactor_events_dispatched_total {self._events_dispatched}",
             f"reactor_pending_decisions {len(self._dispatcher._pending_decisions)}",
+            f"reactor_catchup_commits_remaining {self._catchup_remaining}",
         ]
         if self._last_event_time:
             lines.append(f"reactor_last_event_timestamp {self._last_event_time:.3f}")
