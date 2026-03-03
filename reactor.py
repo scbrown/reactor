@@ -499,6 +499,7 @@ class ReactionDispatcher:
                         "option": opt["value"],
                         "message_id": msg_id,
                         "chat_id": chat_id,
+                        "source_db": event.get("source_db", ""),
                     }
         except urllib.error.URLError as e:
             self._log.error("telegram-decision failed (chat=%s): %s", chat_id, e)
@@ -549,7 +550,10 @@ class ReactionDispatcher:
         for k in to_remove:
             del self._pending_decisions[k]
 
-        return {"ok": True, "bead_id": bead_id, "answer": answer, "answered_by": from_user}
+        return {
+            "ok": True, "bead_id": bead_id, "answer": answer,
+            "answered_by": from_user, "source_db": decision.get("source_db", ""),
+        }
 
     # --- Action: irc ---
 
@@ -997,7 +1001,7 @@ class HealthServer:
                     return
 
                 cb_data = f"reactor_decide:{bead_id}:{answer}"
-                result = reactor.handle_decision_callback(cb_data, user)
+                result = reactor.handle_decision_callback(cb_data, user, channel="irc")
                 self._respond(200, result)
 
             def _respond(self, code, data):
@@ -1664,9 +1668,93 @@ class Reactor:
                     r["options"].append(info["option"])
         return result
 
-    def handle_decision_callback(self, callback_data: str, from_user: str) -> dict:
-        """Delegate to dispatcher's callback handler."""
-        return self._dispatcher.handle_telegram_callback(callback_data, from_user)
+    def handle_decision_callback(self, callback_data: str, from_user: str,
+                                  channel: str = "telegram") -> dict:
+        """Handle decision callback: dispatch state + persist to beads DB."""
+        result = self._dispatcher.handle_telegram_callback(callback_data, from_user)
+
+        if not result.get("ok"):
+            # No pending match — parse from callback_data for IRC direct flow
+            # Format: reactor_decide:{bead_id}:{answer}
+            parts = callback_data.split(":", 2)
+            if len(parts) == 3 and parts[0] == "reactor_decide":
+                bead_id, answer = parts[1], parts[2]
+                # Try to recover source_db from any remaining pending for this bead
+                source_db = ""
+                prefix = f"reactor_decide:{bead_id}:"
+                for k in list(self._dispatcher._pending_decisions):
+                    if k.startswith(prefix):
+                        source_db = self._dispatcher._pending_decisions[k].get("source_db", "")
+                        del self._dispatcher._pending_decisions[k]
+                result = {
+                    "ok": True, "bead_id": bead_id, "answer": answer,
+                    "answered_by": from_user, "source_db": source_db,
+                }
+
+        if result.get("ok"):
+            result["channel"] = channel
+            if not result.get("source_db"):
+                result["source_db"] = self._infer_source_db(result["bead_id"])
+            self._persist_decision(result)
+
+        return result
+
+    def _infer_source_db(self, bead_id: str) -> str:
+        """Infer beads database from bead ID by querying classify-rule databases."""
+        for rule in self._config.get("classify", []):
+            if rule.get("table") != "issues":
+                continue
+            db = rule["database"]
+            try:
+                conn = pymysql.connect(**self._conn_settings, database=db)
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1 FROM issues WHERE id = %s LIMIT 1", (bead_id,))
+                        if cur.fetchone():
+                            return db
+                finally:
+                    conn.close()
+            except Exception:
+                continue
+        return ""
+
+    def _persist_decision(self, result: dict):
+        """Write decision answer to beads DB: add labels + comment event."""
+        bead_id = result["bead_id"]
+        answer = result["answer"]
+        answered_by = result["answered_by"]
+        source_db = result.get("source_db", "")
+        channel = result.get("channel", "unknown")
+
+        if not source_db:
+            self._log.warning("Decision %s: no source_db, cannot persist", bead_id)
+            return
+
+        try:
+            conn = pymysql.connect(**self._conn_settings, database=source_db)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT IGNORE INTO labels (issue_id, label) VALUES (%s, %s)",
+                        (bead_id, "decision:decided"),
+                    )
+                    cur.execute(
+                        "INSERT IGNORE INTO labels (issue_id, label) VALUES (%s, %s)",
+                        (bead_id, f"decision:answer:{answer}"),
+                    )
+                    cur.execute(
+                        "INSERT INTO events (issue_id, event_type, actor, comment, created_at) "
+                        "VALUES (%s, %s, %s, %s, NOW())",
+                        (bead_id, "commented", "reactor",
+                         f"Decision: {answer} (by {answered_by} via {channel})"),
+                    )
+                conn.commit()
+                self._log.info("Persisted decision %s: '%s' by %s via %s",
+                               bead_id, answer, answered_by, channel)
+            finally:
+                conn.close()
+        except Exception as e:
+            self._log.error("Failed to persist decision %s: %s", bead_id, e)
 
     def answer_telegram_callback(self, callback_id: str, text: str):
         """Send answerCallbackQuery to Telegram to dismiss loading spinner."""
