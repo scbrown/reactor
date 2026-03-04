@@ -193,12 +193,31 @@ CREATE TABLE reactor_timers (
 
 ## Status
 
-**Design phase.** See [docs/design.md](docs/design.md) for the full
-architecture and implementation plan.
+**Production.** Reactor is deployed and processing events in real-time.
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| 1. Foundation | Binlog consumer, event classification, reactor_events table | Complete |
+| 2. Decision pipeline | Interactive decisions via Telegram inline keyboards + IRC | Complete |
+| 3. Durable state | Persistent timers, stale detection, alert escalation chains | Complete |
+| 4. Observability | SSE event streaming, Prometheus metrics, mail notifications | Complete |
+
+See [docs/design.md](docs/design.md) for the full architecture.
+
+## Features
+
+- **Binlog streaming**: Sub-second latency via MySQL binlog protocol
+- **Configurable reactions**: JSON-driven rules — no code changes needed
+- **Event classification**: Row changes → semantic events (e.g., `bead.created`, `decision.created`)
+- **Durable timers**: Time-delayed reactions that survive process restarts
+- **SSE endpoint**: Server-Sent Events stream for live dashboard integration
+- **Prometheus metrics**: Events/sec, reaction latency, dispatch success rates
+- **Decision pipeline**: Interactive decisions with callback support
+- **Alert escalation**: Configurable escalation chains with acknowledgment
 
 ## Requirements
 
-- Dolt SQL server with binlog enabled
+- Dolt SQL server with binlog enabled (`dolt_replicate_to_remote` config)
 - Python 3.10+
 - `pymysqlreplication` library
 
