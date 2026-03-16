@@ -1,0 +1,124 @@
+# Reactor configuration for quarterdeck comms bridge
+#
+# Watches steve_scratchpad (beads DB) for mail/issue events,
+# dispatches to IRC channels via HTTP bridge.
+# Uses poll mode (dolt_log + dolt_diff) since Dolt v1.83.4
+# doesn't support binlog source streaming yet.
+
+[reactor]
+dolt_host = "127.0.0.1"
+dolt_port = 3307
+dolt_user = "root"
+dolt_password = ""
+server_id = 100
+mode = "poll"                          # binlog not available on Dolt 1.83.x
+poll_interval = 3                      # seconds between polls
+event_db = "steve_scratchpad"          # store reactor_events in same DB
+health_port = 8075
+log_level = "INFO"
+watched_databases = ["steve_scratchpad", "gt"]
+
+[dispatch]
+irc_bridge_url = "http://127.0.0.1:8076/send"
+
+# ── Event Classification ──────────────────────────────────────────
+# Issues (beads)
+
+[[classify]]
+database = "steve_scratchpad"
+table = "issues"
+id_field = "id"
+insert = "bead.created"
+update = "bead.updated"
+delete = "bead.deleted"
+summary_template = "[{priority}] {title}"
+
+[[classify.sub_classify]]
+condition = "issue_type == 'decision'"
+event_type = "decision.created"
+
+[[classify.update_fields]]
+field = "status"
+default_event = "bead.status_changed"
+
+[[classify.update_fields.transitions]]
+from = "open"
+to = "in_progress"
+event_type = "bead.claimed"
+
+[[classify.update_fields.transitions]]
+to = "closed"
+event_type = "bead.closed"
+
+[[classify.update_fields.transitions]]
+to = "hooked"
+event_type = "bead.hooked"
+
+[[classify.update_fields]]
+field = "assignee"
+event_type = "bead.assigned"
+
+# Wisps (ephemeral messages / mail)
+
+[[classify]]
+database = "gt"
+table = "wisps"
+id_field = "id"
+insert = "mail.received"
+update = "mail.updated"
+summary_template = "{title}"
+
+# ── Reaction Rules ────────────────────────────────────────────────
+
+# High-priority beads → #alerts
+[[reactions]]
+event = "bead.created"
+condition = "priority <= 1"
+actions = [
+    { type = "irc", channel = "#alerts", template = "🔴 P{priority} {title} ({id}) — {created_by}" },
+    { type = "log", template = "P{priority} bead created: {title}" },
+]
+
+# Normal bead creation → #crew
+[[reactions]]
+event = "bead.created"
+condition = "priority > 1"
+actions = [
+    { type = "irc", channel = "#crew", template = "📋 {title} ({id}) P{priority} — {created_by}" },
+]
+
+# Bead closed → #crew
+[[reactions]]
+event = "bead.closed"
+actions = [
+    { type = "irc", channel = "#crew", template = "✓ Closed {id}: {title}" },
+]
+
+# Bead assigned → #crew
+[[reactions]]
+event = "bead.assigned"
+actions = [
+    { type = "irc", channel = "#crew", template = "→ {id} assigned to {assignee}" },
+]
+
+# Bead hooked → #crew
+[[reactions]]
+event = "bead.hooked"
+actions = [
+    { type = "irc", channel = "#crew", template = "🪝 {id} hooked: {title}" },
+]
+
+# Decision beads → #bridge (Overseer's command channel)
+[[reactions]]
+event = "decision.created"
+actions = [
+    { type = "irc", channel = "#bridge", template = "⚡ Decision needed: {title} ({id})" },
+]
+
+# New mail → route to per-agent channel based on recipient
+# (catch-all — more specific routing can be added)
+[[reactions]]
+event = "mail.received"
+actions = [
+    { type = "irc", channel = "#crew", template = "📬 {title} — from {sender}" },
+]

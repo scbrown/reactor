@@ -1379,6 +1379,7 @@ class Reactor:
         while self._running:
             try:
                 changes_found = self._poll_all_databases()
+                self._poll_tables_direct()
                 if not changes_found:
                     time.sleep(poll_interval)
             except KeyboardInterrupt:
@@ -1389,6 +1390,64 @@ class Reactor:
                 time.sleep(poll_interval)
 
         self._shutdown()
+
+    def _poll_tables_direct(self):
+        """Poll watched tables directly for new rows by timestamp.
+
+        In Dolt server mode with @@autocommit=1, SQL writes go to the working
+        set without creating dolt_log entries. This polls tables directly using
+        created_at timestamps to detect changes that dolt_log misses.
+        """
+        for rule in self._config.get("classify", []):
+            db = rule["database"]
+            table = rule["table"]
+            ts_key = f"direct_poll_{db}_{table}"
+            last_ts = self._state.get(ts_key)
+
+            try:
+                conn = pymysql.connect(**self._conn_settings, database=db)
+                with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                    if last_ts:
+                        cur.execute(
+                            f"SELECT * FROM `{table}` WHERE created_at > %s "
+                            "ORDER BY created_at ASC LIMIT 50",
+                            (last_ts,)
+                        )
+                    else:
+                        # First run: just record the latest timestamp, don't process history
+                        cur.execute(
+                            f"SELECT MAX(created_at) as max_ts FROM `{table}`"
+                        )
+                        row = cur.fetchone()
+                        if row and row["max_ts"]:
+                            self._state.set(ts_key, str(row["max_ts"]))
+                        conn.close()
+                        continue
+
+                    new_rows = cur.fetchall()
+                conn.close()
+
+                if not new_rows:
+                    continue
+
+                self._log.info("Direct poll: %d new row(s) in %s.%s",
+                               len(new_rows), db, table)
+
+                # Process each new row as an insert event
+                max_ts = last_ts
+                for row in new_rows:
+                    event = self._classifier.classify_insert(db, table, row)
+                    if event:
+                        self._handle_classified_event(event)
+                    ts = str(row.get("created_at", ""))
+                    if ts > max_ts:
+                        max_ts = ts
+
+                if max_ts != last_ts:
+                    self._state.set(ts_key, max_ts)
+
+            except Exception as e:
+                self._log.debug("Direct poll %s.%s: %s", db, table, e)
 
     def _get_head_commit(self, database: str) -> str | None:
         """Get the latest commit hash for a database."""
