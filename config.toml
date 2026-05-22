@@ -23,6 +23,7 @@ irc_bridge_url = "http://127.0.0.1:8076/send"
 telegram_bot_token = "8714890941:AAENv6QGFmtcXhvpBrL7sJXwrlcpz9sTpbM"
 telegram_chat_id = "8360797693"
 telegram_webhook_secret = "4feaf7afeb10fa74758ecc16db84210298459136df5a1ac5dab391217b0fc865"
+github_webhook_secret = "c707895022a14311bb73c2e959e80e0f8a54dead03ce710d45fe9181e6855a0d"
 
 # ── Event Classification ──────────────────────────────────────────
 # Issues (beads)
@@ -160,4 +161,73 @@ actions = [
 event = "host.alert.warn"
 actions = [
     { type = "telegram", template = "⚠️ HOST WARN: {title}\n{summary}" },
+]
+
+# ── GitHub Webhook Events ─────────────────────────────────────────
+
+# PR opened/reopened → #crew + log
+[[reactions]]
+event = "github.pr.opened"
+actions = [
+    { type = "irc", channel = "#crew", template = "🔀 PR opened: {summary}" },
+    { type = "log", template = "GH PR opened: {summary}" },
+]
+
+[[reactions]]
+event = "github.pr.reopened"
+actions = [
+    { type = "irc", channel = "#crew", template = "🔀 PR reopened: {summary}" },
+]
+
+# PR merged → #crew
+[[reactions]]
+event = "github.pr.merged"
+actions = [
+    { type = "irc", channel = "#crew", template = "✅ PR merged: {summary}" },
+    { type = "log", template = "GH PR merged: {summary}" },
+]
+
+# PR closed (not merged) → #crew
+[[reactions]]
+event = "github.pr.closed"
+actions = [
+    { type = "irc", channel = "#crew", template = "❌ PR closed: {summary}" },
+]
+
+# Review approved → #crew + Telegram (steve-PRs getting approved)
+[[reactions]]
+event = "github.review.approved"
+actions = [
+    { type = "irc", channel = "#crew", template = "👍 Review approved: {summary}" },
+    { type = "telegram", template = "👍 {summary}" },
+]
+
+# Review changes_requested → #crew + Telegram HIGH
+[[reactions]]
+event = "github.review.changes_requested"
+actions = [
+    { type = "irc", channel = "#crew", template = "🔴 Changes requested: {summary}" },
+    { type = "telegram", template = "🔴 Changes requested: {summary}" },
+]
+
+# Review dismissed → #crew
+[[reactions]]
+event = "github.review.dismissed"
+actions = [
+    { type = "irc", channel = "#crew", template = "⚠️ Review dismissed: {summary}" },
+]
+
+# CI failure → #alerts + Telegram HIGH
+[[reactions]]
+event = "github.ci.failure"
+actions = [
+    { type = "telegram", template = "🚨 CI FAILED: {summary}" },
+    { type = "irc", channel = "#alerts", template = "🚨 CI FAILED: {summary}" },
+]
+
+# Comments on PRs → #crew
+[[reactions]]
+event = "github.comment"
+actions = [
+    { type = "irc", channel = "#crew", template = "💬 {summary}" },
 ]

@@ -13,6 +13,8 @@ Usage:
 
 import argparse
 import datetime
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -955,6 +957,11 @@ class HealthServer:
             def do_POST(self):
                 content_len = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(content_len) if content_len else b""
+
+                if self.path == "/webhook/github":
+                    self._handle_github_webhook(body)
+                    return
+
                 try:
                     data = json.loads(body) if body else {}
                 except json.JSONDecodeError:
@@ -963,6 +970,8 @@ class HealthServer:
 
                 if self.path == "/callback/telegram":
                     self._handle_telegram_callback(data)
+                elif self.path == "/webhook/telegram":
+                    self._handle_telegram_webhook(data)
                 elif self.path == "/callback/irc":
                     self._handle_irc_callback(data)
                 elif self.path == "/event":
@@ -1003,6 +1012,74 @@ class HealthServer:
                 cb_data = f"reactor_decide:{bead_id}:{answer}"
                 result = reactor.handle_decision_callback(cb_data, user, channel="irc")
                 self._respond(200, result)
+
+            def _handle_telegram_webhook(self, data):
+                """Handle inbound Telegram messages via Bot API webhook."""
+                expected_secret = reactor._config.get("dispatch", {}).get(
+                    "telegram_webhook_secret", "")
+                if expected_secret:
+                    header_secret = self.headers.get(
+                        "X-Telegram-Bot-Api-Secret-Token", "")
+                    if header_secret != expected_secret:
+                        self._respond(403, {"ok": False, "error": "forbidden"})
+                        return
+
+                self._respond(200, {"ok": True})
+
+                msg = data.get("message") or data.get("edited_message")
+                if not msg:
+                    return
+
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                expected_chat = str(reactor._config.get("dispatch", {}).get(
+                    "telegram_chat_id", ""))
+                if not expected_chat or chat_id != expected_chat:
+                    reactor._log.warning(
+                        "telegram webhook: ignored chat %s (expected %s)",
+                        chat_id, expected_chat)
+                    return
+
+                text = msg.get("text", "").strip()
+                if not text:
+                    return
+
+                from_user = msg.get("from", {}).get("first_name", "telegram")
+                threading.Thread(
+                    target=reactor.create_ask_bead,
+                    args=(text, from_user),
+                    daemon=True,
+                ).start()
+
+            def _handle_github_webhook(self, raw_body: bytes):
+                """Handle inbound GitHub webhook events."""
+                secret = reactor._config.get("dispatch", {}).get(
+                    "github_webhook_secret", "")
+                if secret:
+                    sig_header = self.headers.get("X-Hub-Signature-256", "")
+                    if not sig_header.startswith("sha256="):
+                        self._respond(403, {"ok": False, "error": "forbidden"})
+                        return
+                    expected = "sha256=" + hmac.new(
+                        secret.encode(), raw_body, hashlib.sha256
+                    ).hexdigest()
+                    if not hmac.compare_digest(sig_header, expected):
+                        self._respond(403, {"ok": False, "error": "forbidden"})
+                        return
+
+                self._respond(200, {"ok": True})
+
+                try:
+                    data = json.loads(raw_body) if raw_body else {}
+                except json.JSONDecodeError:
+                    return
+
+                gh_event = self.headers.get("X-GitHub-Event", "unknown")
+                action = data.get("action", "")
+                threading.Thread(
+                    target=reactor.handle_github_event,
+                    args=(gh_event, action, data),
+                    daemon=True,
+                ).start()
 
             def _respond(self, code, data):
                 body = json.dumps(data, default=str).encode("utf-8")
@@ -1618,6 +1695,141 @@ class Reactor:
 
             self._events_processed += 1
 
+    # --- GitHub webhook processing ---
+
+    GH_EVENTS_FILE = os.path.expanduser("~/.cache/moneypenny/gh-events.jsonl")
+
+    def handle_github_event(self, gh_event: str, action: str, data: dict):
+        """Process a GitHub webhook delivery and inject into reactor pipeline."""
+        repo_full = data.get("repository", {}).get("full_name", "unknown")
+        repo_short = repo_full.split("/")[-1] if "/" in repo_full else repo_full
+        sender = data.get("sender", {}).get("login", "unknown")
+
+        event_type, subject_id, summary, pr_number = self._classify_github_event(
+            gh_event, action, data, repo_short, sender
+        )
+        if not event_type:
+            return
+
+        record = {
+            "ts": datetime.datetime.utcnow().isoformat(),
+            "repo": repo_short,
+            "event_type": event_type,
+            "action": action,
+            "pr_number": pr_number,
+            "actor": sender,
+            "summary": summary,
+        }
+        try:
+            with open(self.GH_EVENTS_FILE, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError as e:
+            self._log.error("gh-events write failed: %s", e)
+
+        event = {
+            "event_type": event_type,
+            "subject_id": subject_id,
+            "summary": summary,
+            "source_db": "external",
+            "source_table": "github",
+            "actor": sender,
+            "payload": {
+                "repo": repo_short,
+                "repo_full": repo_full,
+                "pr_number": pr_number,
+                "action": action,
+                "sender": sender,
+                "gh_event": gh_event,
+            },
+        }
+        self._handle_classified_event(event)
+
+    def _classify_github_event(self, gh_event, action, data, repo, sender):
+        """Return (event_type, subject_id, summary, pr_number) or (None,...) to skip."""
+        pr = data.get("pull_request") or {}
+        pr_number = pr.get("number") or data.get("number", 0)
+        pr_title = pr.get("title") or data.get("pull_request", {}).get("title", "")
+        subj = f"{repo}#{pr_number}" if pr_number else f"{repo}/{gh_event}"
+
+        if gh_event == "pull_request":
+            if action in ("opened", "reopened"):
+                return (f"github.pr.{action}", subj,
+                        f"PR {action}: {repo}#{pr_number} {pr_title} by {sender}",
+                        pr_number)
+            if action == "closed":
+                merged = pr.get("merged", False)
+                tag = "merged" if merged else "closed"
+                return (f"github.pr.{tag}", subj,
+                        f"PR {tag}: {repo}#{pr_number} {pr_title}",
+                        pr_number)
+            if action in ("ready_for_review", "converted_to_draft"):
+                return (f"github.pr.{action}", subj,
+                        f"PR {action}: {repo}#{pr_number} {pr_title}",
+                        pr_number)
+            return (None, None, None, None)
+
+        if gh_event == "pull_request_review":
+            state = data.get("review", {}).get("state", action)
+            reviewer = data.get("review", {}).get("user", {}).get("login", sender)
+            return (f"github.review.{state}", subj,
+                    f"Review {state}: {repo}#{pr_number} by {reviewer}",
+                    pr_number)
+
+        if gh_event == "issue_comment" or gh_event == "pull_request_review_comment":
+            comment_body = data.get("comment", {}).get("body", "")[:120]
+            commenter = data.get("comment", {}).get("user", {}).get("login", sender)
+            return ("github.comment", subj,
+                    f"Comment on {repo}#{pr_number} by {commenter}: {comment_body}",
+                    pr_number)
+
+        if gh_event == "check_suite":
+            conclusion = data.get("check_suite", {}).get("conclusion", action)
+            if conclusion in ("failure", "timed_out"):
+                branch = data.get("check_suite", {}).get("head_branch", "?")
+                return ("github.ci.failure", f"{repo}/{branch}",
+                        f"CI failed: {repo} branch {branch} ({conclusion})",
+                        0)
+            if conclusion == "success":
+                branch = data.get("check_suite", {}).get("head_branch", "?")
+                return ("github.ci.success", f"{repo}/{branch}",
+                        f"CI passed: {repo} branch {branch}",
+                        0)
+            return (None, None, None, None)
+
+        if gh_event == "workflow_run":
+            conclusion = data.get("workflow_run", {}).get("conclusion", "")
+            name = data.get("workflow_run", {}).get("name", "workflow")
+            branch = data.get("workflow_run", {}).get("head_branch", "?")
+            if conclusion in ("failure", "timed_out"):
+                return ("github.ci.failure", f"{repo}/{name}/{branch}",
+                        f"Workflow failed: {repo} {name} on {branch}",
+                        0)
+            return (None, None, None, None)
+
+        if gh_event == "status":
+            state = data.get("state", "")
+            ctx = data.get("context", "")
+            if state in ("failure", "error"):
+                sha_short = data.get("sha", "")[:8]
+                return ("github.ci.failure", f"{repo}/{ctx}",
+                        f"Status {state}: {repo} {ctx} @ {sha_short}",
+                        0)
+            return (None, None, None, None)
+
+        if gh_event in ("label", "issues"):
+            return (f"github.{gh_event}.{action}",
+                    f"{repo}/{gh_event}",
+                    f"{gh_event} {action} on {repo} by {sender}",
+                    0)
+
+        if gh_event == "ping":
+            self._log.info("GitHub webhook ping from %s: %s",
+                           repo, data.get("zen", ""))
+            return (None, None, None, None)
+
+        self._log.debug("Unhandled GitHub event: %s.%s from %s", gh_event, action, repo)
+        return (None, None, None, None)
+
     def inject_external_event(self, data: dict) -> dict:
         """Inject an externally-sourced event into the reactor pipeline.
 
@@ -1827,6 +2039,25 @@ class Reactor:
             urllib.request.urlopen(req, timeout=10)
         except Exception as e:
             self._log.debug("answerCallbackQuery failed: %s", e)
+
+    def create_ask_bead(self, text: str, from_user: str):
+        """Create an ask-bead from an inbound Telegram message."""
+        title = text[:80] + ("..." if len(text) > 80 else "")
+        try:
+            bd = os.path.expanduser("~/.local/bin/bd")
+            result = subprocess.run(
+                [bd, "create", title, "-t", "task", "-l", "ask,from-telegram",
+                 "-d", f"From {from_user} via Telegram:\n\n{text}",
+                 "-a", "quarterdeck/crew/moneypenny"],
+                capture_output=True, text=True, timeout=15,
+                cwd=os.path.expanduser("~/workspace/quarterdeck"),
+            )
+            if result.returncode == 0:
+                self._log.info("telegram ask-bead created: %s (from %s)", title, from_user)
+            else:
+                self._log.error("bd create failed: %s", result.stderr.strip())
+        except Exception as e:
+            self._log.error("Failed to create ask-bead: %s", e)
 
     def prometheus_metrics(self) -> str:
         lines = [
