@@ -1747,8 +1747,9 @@ class Reactor:
     def _classify_github_event(self, gh_event, action, data, repo, sender):
         """Return (event_type, subject_id, summary, pr_number) or (None,...) to skip."""
         pr = data.get("pull_request") or {}
-        pr_number = pr.get("number") or data.get("number", 0)
-        pr_title = pr.get("title") or data.get("pull_request", {}).get("title", "")
+        issue = data.get("issue") or {}
+        pr_number = pr.get("number") or issue.get("number") or data.get("number", 0)
+        pr_title = pr.get("title") or issue.get("title") or ""
         subj = f"{repo}#{pr_number}" if pr_number else f"{repo}/{gh_event}"
 
         if gh_event == "pull_request":
