@@ -20,6 +20,9 @@ watched_databases = ["steve_scratchpad", "gt"]
 
 [dispatch]
 irc_bridge_url = "http://127.0.0.1:8076/send"
+telegram_bot_token = "8714890941:AAENv6QGFmtcXhvpBrL7sJXwrlcpz9sTpbM"
+telegram_chat_id = "8360797693"
+telegram_webhook_secret = "4feaf7afeb10fa74758ecc16db84210298459136df5a1ac5dab391217b0fc865"
 
 # ── Event Classification ──────────────────────────────────────────
 # Issues (beads)
@@ -70,12 +73,13 @@ summary_template = "{title}"
 
 # ── Reaction Rules ────────────────────────────────────────────────
 
-# High-priority beads → #alerts
+# High-priority beads → #alerts + Telegram
 [[reactions]]
 event = "bead.created"
 condition = "priority <= 1"
 actions = [
     { type = "irc", channel = "#alerts", template = "🔴 P{priority} {title} ({id}) — {created_by}" },
+    { type = "telegram", template = "🔴 P{priority} bead: {title} ({id})\nCreated by: {created_by}" },
     { type = "log", template = "P{priority} bead created: {title}" },
 ]
 
@@ -108,11 +112,12 @@ actions = [
     { type = "irc", channel = "#crew", template = "🪝 {id} hooked: {title}" },
 ]
 
-# Decision beads → #bridge (Overseer's command channel)
+# Decision beads → #bridge + Telegram (interactive decision)
 [[reactions]]
 event = "decision.created"
 actions = [
     { type = "irc", channel = "#bridge", template = "⚡ Decision needed: {title} ({id})" },
+    { type = "telegram-decision", template = "⚡ Decision needed: {title} ({id})" },
 ]
 
 # New mail → route to per-agent channel based on recipient
@@ -121,4 +126,38 @@ actions = [
 event = "mail.received"
 actions = [
     { type = "irc", channel = "#crew", template = "📬 {title} — from {sender}" },
+]
+
+# ── Patrol Notifications (injected via /event endpoint) ──────────
+
+# Patrol alert → Telegram + IRC #alerts
+[[reactions]]
+event = "patrol.alert"
+actions = [
+    { type = "telegram", template = "🚨 PATROL: {title}\n{summary}" },
+    { type = "irc", channel = "#alerts", template = "🚨 PATROL: {title} — {summary}" },
+]
+
+# Patrol warning → Telegram only
+[[reactions]]
+event = "patrol.warning"
+actions = [
+    { type = "telegram", template = "⚠️ PATROL: {title}\n{summary}" },
+]
+
+# ── Host Performance Alerts (injected by host-metrics-probe) ────
+
+# Critical host alert → Telegram + IRC #alerts
+[[reactions]]
+event = "host.alert.critical"
+actions = [
+    { type = "telegram", template = "🚨 HOST CRITICAL: {title}\n{summary}" },
+    { type = "irc", channel = "#alerts", template = "🚨 HOST CRITICAL: {title}" },
+]
+
+# Warning host alert → Telegram only
+[[reactions]]
+event = "host.alert.warn"
+actions = [
+    { type = "telegram", template = "⚠️ HOST WARN: {title}\n{summary}" },
 ]
