@@ -2,8 +2,10 @@
 #
 # Watches steve_scratchpad (beads DB) for mail/issue events,
 # dispatches to IRC channels via HTTP bridge.
-# Uses poll mode (dolt_log + dolt_diff) since Dolt v1.83.4
-# doesn't support binlog source streaming yet.
+# Uses binlog mode (sub-second GTID stream). Dolt 1.83.4 DOES support binlog
+# source streaming once log_bin/gtid_mode/binlog_row_metadata=FULL are persisted
+# (ss-dfyc, 2026-06-28; the old "no binlog on 1.83.x" note was a false negative).
+# Auto-falls back to poll if @@log_bin is off or the stream errors.
 
 [reactor]
 dolt_host = "127.0.0.1"
@@ -11,7 +13,7 @@ dolt_port = 3307
 dolt_user = "root"
 dolt_password = ""
 server_id = 100
-mode = "poll"                          # binlog not available on Dolt 1.83.x
+mode = "binlog"                        # ss-dfyc: sub-second GTID stream; auto-falls back to poll if log_bin off
 poll_interval = 3                      # seconds between polls
 event_db = "steve_scratchpad"          # store reactor_events in same DB
 health_port = 8075
