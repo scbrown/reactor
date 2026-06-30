@@ -1,0 +1,8 @@
+:9002 {
+	handle_path /chat/* {
+		reverse_proxy localhost:9000
+	}
+	handle /chat {
+		redir /chat/ permanent
+	}
+}
