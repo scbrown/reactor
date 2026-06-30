@@ -129,6 +129,26 @@ def load_config(path: str) -> dict:
             return json.load(f)
 
 
+# Secrets are sourced from the environment (S1, ss-xskg) — never the git-tracked
+# config.toml (scbrown/reactor is a PUBLIC repo). A non-empty env var overrides the
+# config value; unset/empty leaves config untouched (backward compatible). Values live
+# in an untracked systemd EnvironmentFile (~/.config/reactor/reactor.secrets, 0600).
+_SECRET_ENV = {
+    ("reactor", "dolt_password"): "REACTOR_DOLT_PASSWORD",
+    ("dispatch", "telegram_bot_token"): "REACTOR_TELEGRAM_BOT_TOKEN",
+    ("dispatch", "telegram_webhook_secret"): "REACTOR_TELEGRAM_WEBHOOK_SECRET",
+    ("dispatch", "github_webhook_secret"): "REACTOR_GITHUB_WEBHOOK_SECRET",
+}
+
+
+def apply_secret_env_overrides(config: dict) -> None:
+    """Overlay secrets from the environment so they never live in tracked config (S1)."""
+    for (section, key), env_name in _SECRET_ENV.items():
+        val = os.environ.get(env_name)
+        if val:
+            config.setdefault(section, {})[key] = val
+
+
 # ---------------------------------------------------------------------------
 # Schema mapper — resolves column indices to names for binlog events
 # ---------------------------------------------------------------------------
@@ -2085,6 +2105,7 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.config)
+    apply_secret_env_overrides(config)
     rc = config.get("reactor", {})
 
     log_level = args.log_level or rc.get("log_level", "INFO")

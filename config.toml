@@ -22,10 +22,10 @@ watched_databases = ["steve_scratchpad", "gt"]
 
 [dispatch]
 irc_bridge_url = "http://127.0.0.1:8076/send"
-telegram_bot_token = "8714890941:AAENv6QGFmtcXhvpBrL7sJXwrlcpz9sTpbM"
+telegram_bot_token = ""
 telegram_chat_id = "8360797693"
-telegram_webhook_secret = "4feaf7afeb10fa74758ecc16db84210298459136df5a1ac5dab391217b0fc865"
-github_webhook_secret = "c707895022a14311bb73c2e959e80e0f8a54dead03ce710d45fe9181e6855a0d"
+telegram_webhook_secret = ""
+github_webhook_secret = ""
 
 # ── Event Classification ──────────────────────────────────────────
 # Issues (beads)
