@@ -233,3 +233,38 @@ event = "github.comment"
 actions = [
     { type = "irc", channel = "#crew", template = "💬 {summary}" },
 ]
+
+# ── (b) Coordination nudges (ss-xskg, Steve-approved 2026-06-30) ──────────────────
+# gt-relay (192.168.4.187:8076) is unreachable from steve-dev, so nudges go via the LOCAL
+# `gt` CLI through reactor's shell sink, mail mode = durable + non-interrupting (moneypenny
+# drains on patrol — matches the design's gt-nudge mode=queue intent). moneypenny is local
+# crew, so local delivery is correct (no cross-host reach needed).
+# SECURITY: shell=True — interpolate ONLY shell-safe slugs ({id}/{issue_id}/{label}), NEVER
+# free-text {title} (decision beads can originate from untrusted Telegram inbound).
+
+# decision.decided: _persist_decision writes a `decision:answer:<x>` row into the labels
+# table; classify that insert into a decision.decided event carrying the answer label.
+[[classify]]
+database = "steve_scratchpad"
+table = "labels"
+id_field = "issue_id"
+insert = "label.added"
+summary_template = "{label} on {issue_id}"
+
+[[classify.sub_classify]]
+condition = "label.startswith('decision:answer:')"
+event_type = "decision.decided"
+
+# A decision is RAISED -> nudge coordination (in addition to the Overseer's Telegram).
+[[reactions]]
+event = "decision.created"
+actions = [
+    { type = "shell", command = "gt mail send quarterdeck/crew/moneypenny -s 'Decision pending Overseer ({id})' -m 'Reactor: decision bead {id} is awaiting the Overseer in Telegram. Durable nudge; look it up with: bd show {id}'" },
+]
+
+# A decision is ANSWERED -> let coordination learn the outcome without polling.
+[[reactions]]
+event = "decision.decided"
+actions = [
+    { type = "shell", command = "gt mail send quarterdeck/crew/moneypenny -s 'Decision answered ({issue_id})' -m 'Reactor: decision {issue_id} resolved -> {label}. Outcome propagated without polling.'" },
+]
