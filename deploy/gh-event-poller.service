@@ -1,0 +1,24 @@
+[Unit]
+Description=Reactor GitHub repo-events poller (PR lifecycle/CI → reactor /webhook/github)
+Documentation=https://github.com/Sema4AI/koodivaja/blob/master/steve/docs/artifacts/gh-event-notifications/design.md
+After=network.target reactor.service
+Wants=reactor.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Posts webhook-shaped payloads to /webhook/github with an HMAC signature. The
+# secret lives in the environment (reactor.secrets, S1) — the same file reactor
+# validates against — so the poller and reactor sign/verify with one value.
+ExecStart=/usr/bin/python3 /home/ubuntu/workspace/reactor/gh-event-poller.py --config /home/ubuntu/workspace/reactor/config.toml
+WorkingDirectory=/home/ubuntu/workspace/reactor
+EnvironmentFile=%h/.config/reactor/reactor.secrets
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=30s
+StandardOutput=append:/home/ubuntu/workspace/daemon/gh-event-poller.log
+StandardError=append:/home/ubuntu/workspace/daemon/gh-event-poller.log
+
+[Install]
+WantedBy=default.target

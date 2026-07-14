@@ -152,7 +152,11 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.config)
-    secret = config.get("dispatch", {}).get("github_webhook_secret", "")
+    # S1 (ss-xskg): the webhook secret lives in the environment (reactor.secrets),
+    # not tracked config.toml. Reactor validates with the env value, so the poller
+    # must sign with the same one — env first, config only as a legacy fallback.
+    secret = os.environ.get("REACTOR_GITHUB_WEBHOOK_SECRET") or config.get(
+        "dispatch", {}).get("github_webhook_secret", "")
     token = get_gh_token()
     if not token:
         print("WARNING: no GitHub token found, rate limit will be 60/hour", file=sys.stderr)

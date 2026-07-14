@@ -1787,6 +1787,14 @@ class Reactor:
                 return (f"github.pr.{action}", subj,
                         f"PR {action}: {repo}#{pr_number} {pr_title}",
                         pr_number)
+            if action == "review_requested":
+                # Same github.review_requested type the Notifications poller
+                # emits via /event — one taxonomy regardless of transport.
+                author = pr.get("user", {}).get("login", sender)
+                who = f" by {author}" if author else ""
+                return ("github.review_requested", subj,
+                        f"Review requested: {repo}#{pr_number} {pr_title}{who}",
+                        pr_number)
             return (None, None, None, None)
 
         if gh_event == "pull_request_review":

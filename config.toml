@@ -219,6 +219,28 @@ actions = [
     { type = "irc", channel = "#crew", template = "⚠️ Review dismissed: {summary}" },
 ]
 
+# Review requested (Steve tagged as reviewer) → Telegram + #crew + log.
+# Steve's primary ask (ss-s1bm / ss-n0icm). Sourced from the Notifications poller
+# (gh-notif-poller.py → POST /event) today; the webhook classifier emits the same
+# github.review_requested type once Lane 2 lands — one taxonomy, either transport.
+# {summary} is composed upstream as "Review requested: <repo>#<pr> <title> by <author>".
+[[reactions]]
+event = "github.review_requested"
+actions = [
+    { type = "telegram", template = "👀 {summary}" },
+    { type = "irc", channel = "#crew", template = "👀 {summary}" },
+    { type = "log", template = "GH review requested: {summary}" },
+]
+
+# Mentions of Steve → Telegram + #crew + log (MVP default, design Open-Q #3).
+[[reactions]]
+event = "github.mention"
+actions = [
+    { type = "telegram", template = "📣 {summary}" },
+    { type = "irc", channel = "#crew", template = "📣 {summary}" },
+    { type = "log", template = "GH mention: {summary}" },
+]
+
 # CI failure → #alerts + Telegram HIGH
 [[reactions]]
 event = "github.ci.failure"

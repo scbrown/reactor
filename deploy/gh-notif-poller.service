@@ -1,0 +1,22 @@
+[Unit]
+Description=Reactor GitHub Notifications poller (review_requested/mention → reactor /event)
+Documentation=https://github.com/Sema4AI/koodivaja/blob/master/steve/docs/artifacts/gh-event-notifications/design.md
+After=network.target reactor.service
+Wants=reactor.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Posts to reactor's /event inject endpoint — no HMAC secret needed (unlike the
+# webhook poller). GitHub auth comes from `gh auth token` (gh is on PATH below).
+ExecStart=/usr/bin/python3 /home/ubuntu/workspace/reactor/gh-notif-poller.py --config /home/ubuntu/workspace/reactor/config.toml
+WorkingDirectory=/home/ubuntu/workspace/reactor
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=30s
+StandardOutput=append:/home/ubuntu/workspace/daemon/gh-notif-poller.log
+StandardError=append:/home/ubuntu/workspace/daemon/gh-notif-poller.log
+
+[Install]
+WantedBy=default.target
