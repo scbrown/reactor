@@ -85,6 +85,7 @@ class DefaultDict(dict):
     Used with str.format_map() so that unresolvable template placeholders
     are left as-is instead of raising KeyError.
     """
+
     def __missing__(self, key):
         return "{" + key + "}"
 
@@ -173,6 +174,7 @@ def _audit_event_request(client_ip, path, data, outcome):
 # Schema mapper — resolves column indices to names for binlog events
 # ---------------------------------------------------------------------------
 
+
 class SchemaMapper:
     """Maps table column indices to column names by querying INFORMATION_SCHEMA."""
 
@@ -212,6 +214,7 @@ class SchemaMapper:
 # ---------------------------------------------------------------------------
 # Event classifier — turns raw binlog row changes into semantic events
 # ---------------------------------------------------------------------------
+
 
 class EventClassifier:
     """Classifies binlog row changes into semantic event types."""
@@ -254,7 +257,9 @@ class EventClassifier:
             "payload": row,
         }
 
-    def classify_update(self, database: str, table: str, before: dict, after: dict) -> dict | None:
+    def classify_update(
+        self, database: str, table: str, before: dict, after: dict
+    ) -> dict | None:
         """Classify an UPDATE event."""
         rule = self._rules.get((database, table))
         if not rule:
@@ -286,7 +291,9 @@ class EventClassifier:
             "source_db": database,
             "source_table": table,
             "subject_id": self._extract_id(after, rule),
-            "actor": after.get("actor", after.get("created_by", before.get("actor", ""))),
+            "actor": after.get(
+                "actor", after.get("created_by", before.get("actor", ""))
+            ),
             "summary": self._build_summary(event_type, after, rule, before),
             "payload": {"before": before, "after": after},
         }
@@ -316,7 +323,9 @@ class EventClassifier:
         id_field = rule.get("id_field", "id")
         return str(row.get(id_field, ""))
 
-    def _build_summary(self, event_type: str, row: dict, rule: dict, before: dict = None) -> str:
+    def _build_summary(
+        self, event_type: str, row: dict, rule: dict, before: dict = None
+    ) -> str:
         """Build a human-readable summary."""
         template = rule.get("summary_template", "{event_type}: {id}")
         try:
@@ -356,6 +365,7 @@ class EventClassifier:
 # Reaction dispatcher — executes actions when events match rules
 # ---------------------------------------------------------------------------
 
+
 class ReactionDispatcher:
     """Dispatches reactions based on event rules.
 
@@ -368,6 +378,12 @@ class ReactionDispatcher:
     - telegram-decision: Send Telegram inline keyboard for decision beads
     - irc: Send to IRC channel via aegis-irc HTTP bridge
     """
+
+    # Privileged sinks (by config action-type string) that can cause side effects
+    # beyond a notification: run a command, wake/act as an agent, or POST to an
+    # arbitrary URL. These MUST NOT fire on externally-sourced events. See the
+    # source_db capability gate in _execute_action (ss-u72jx L1 / ss-bjhyb H3).
+    PRIVILEGED_SINKS = frozenset({"shell", "gt-nudge", "webhook"})
 
     def __init__(self, rules: list[dict], config: dict, dry_run: bool = False):
         self._rules = rules
@@ -408,8 +424,32 @@ class ReactionDispatcher:
         action_type = action.get("type", "")
         try:
             if self._dry_run:
-                self._log.info("[DRY RUN] Would execute %s for %s (%s)",
-                               action_type, event["event_type"], event.get("subject_id", "?"))
+                self._log.info(
+                    "[DRY RUN] Would execute %s for %s (%s)",
+                    action_type,
+                    event["event_type"],
+                    event.get("subject_id", "?"),
+                )
+                return
+
+            # ── source_db capability gate (ss-u72jx L1 / ss-bjhyb H3) ──
+            # Privileged sinks NEVER fire on externally-sourced events. `source_db`
+            # is SERVER-SET on every ingress (binlog → real DB name; POST /event and
+            # /webhook/* → hardcoded "external") and the caller CANNOT override it —
+            # unlike `source_table`, which POST /event self-reports (inject_external_event).
+            # This closes the /event → shell-sink RCE and gates the Deck-action wake.
+            # Any NEW untrusted ingress MUST stamp source_db="external".
+            if (
+                action_type in self.PRIVILEGED_SINKS
+                and event.get("source_db") == "external"
+            ):
+                self._log.warning(
+                    "REFUSED privileged sink %r for externally-sourced event %s "
+                    "(event_type=%s, source_db=external) — source_db capability gate",
+                    action_type,
+                    event.get("subject_id", "?"),
+                    event.get("event_type", "?"),
+                )
                 return
 
             handler = {
@@ -431,8 +471,12 @@ class ReactionDispatcher:
             else:
                 self._log.warning("Unknown action type: %s", action_type)
         except Exception as e:
-            self._log.error("Action %s failed for event %s: %s",
-                            action_type, event.get("subject_id", "?"), e)
+            self._log.error(
+                "Action %s failed for event %s: %s",
+                action_type,
+                event.get("subject_id", "?"),
+                e,
+            )
 
     # --- Action: message-router ---
 
@@ -446,21 +490,26 @@ class ReactionDispatcher:
         sender = action.get("sender", "reactor")
         priority = self._interpolate(action.get("priority", "info"), event)
 
-        body = json.dumps({
-            "group": group,
-            "text": text,
-            "sender": sender,
-            "priority": priority,
-        }).encode("utf-8")
+        body = json.dumps(
+            {
+                "group": group,
+                "text": text,
+                "sender": sender,
+                "priority": priority,
+            }
+        ).encode("utf-8")
 
         req = urllib.request.Request(
-            router_url, data=body,
+            router_url,
+            data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                self._log.info("message-router → %s group=%s (%d)", text[:60], group, resp.status)
+                self._log.info(
+                    "message-router → %s group=%s (%d)", text[:60], group, resp.status
+                )
         except urllib.error.URLError as e:
             self._log.error("message-router failed (group=%s): %s", group, e)
 
@@ -472,18 +521,24 @@ class ReactionDispatcher:
         if not token:
             self._log.error("telegram action: no bot token configured")
             return
-        chat_id = action.get("chat_id", self._config.get("dispatch", {}).get("telegram_chat_id", ""))
+        chat_id = action.get(
+            "chat_id", self._config.get("dispatch", {}).get("telegram_chat_id", "")
+        )
         text = self._interpolate(action.get("template", "{summary}"), event)
 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        body = json.dumps({
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }).encode("utf-8")
+        body = json.dumps(
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+        ).encode("utf-8")
 
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}
+        )
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 self._log.info("telegram → chat %s (%d)", chat_id, resp.status)
@@ -498,16 +553,23 @@ class ReactionDispatcher:
         if not token:
             self._log.error("telegram-decision: no bot token configured")
             return
-        chat_id = action.get("chat_id", self._config.get("dispatch", {}).get("telegram_chat_id", ""))
+        chat_id = action.get(
+            "chat_id", self._config.get("dispatch", {}).get("telegram_chat_id", "")
+        )
         bead_id = event.get("subject_id", "?")
         payload = event.get("payload", {})
         title = payload.get("title", "") if isinstance(payload, dict) else ""
-        description = payload.get("description", "") if isinstance(payload, dict) else ""
+        description = (
+            payload.get("description", "") if isinstance(payload, dict) else ""
+        )
 
         # Parse options from bead labels or description
         options = self._extract_decision_options(payload)
         if not options:
-            options = [{"label": "Approve", "value": "approve"}, {"label": "Reject", "value": "reject"}]
+            options = [
+                {"label": "Approve", "value": "approve"},
+                {"label": "Reject", "value": "reject"},
+            ]
 
         # Build inline keyboard
         callback_prefix = f"reactor_decide:{bead_id}"
@@ -516,23 +578,36 @@ class ReactionDispatcher:
             cb_data = f"{callback_prefix}:{opt['value']}"
             keyboard.append([{"text": opt["label"], "callback_data": cb_data}])
 
-        text = f"<b>Decision needed</b>: {title}\n{description[:500]}" if description else f"<b>Decision needed</b>: {title}"
+        text = (
+            f"<b>Decision needed</b>: {title}\n{description[:500]}"
+            if description
+            else f"<b>Decision needed</b>: {title}"
+        )
         text += f"\n\n<i>Bead: {bead_id}</i>"
 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        body = json.dumps({
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "reply_markup": {"inline_keyboard": keyboard},
-        }).encode("utf-8")
+        body = json.dumps(
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": {"inline_keyboard": keyboard},
+            }
+        ).encode("utf-8")
 
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}
+        )
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 resp_data = json.loads(resp.read().decode())
                 msg_id = resp_data.get("result", {}).get("message_id")
-                self._log.info("telegram-decision → chat %s msg %s for %s", chat_id, msg_id, bead_id)
+                self._log.info(
+                    "telegram-decision → chat %s msg %s for %s",
+                    chat_id,
+                    msg_id,
+                    bead_id,
+                )
                 # Track pending decision for callback handling
                 for opt in options:
                     cb_data = f"{callback_prefix}:{opt['value']}"
@@ -556,10 +631,13 @@ class ReactionDispatcher:
         # Check for explicit options in description (format: [A] Label | [B] Label)
         description = payload.get("description", "")
         import re
-        option_pattern = re.compile(r'\[([A-Z0-9])\]\s*([^|\n]+)')
+
+        option_pattern = re.compile(r"\[([A-Z0-9])\]\s*([^|\n]+)")
         matches = option_pattern.findall(description)
         if matches:
-            return [{"label": label.strip(), "value": key.lower()} for key, label in matches]
+            return [
+                {"label": label.strip(), "value": key.lower()} for key, label in matches
+            ]
         # Check labels for option: prefix
         labels = payload.get("labels", "")
         if isinstance(labels, str) and "option:" in labels:
@@ -580,11 +658,16 @@ class ReactionDispatcher:
         """
         decision = self._pending_decisions.get(callback_data)
         if not decision:
-            return {"ok": False, "error": "Unknown callback (expired or already answered)"}
+            return {
+                "ok": False,
+                "error": "Unknown callback (expired or already answered)",
+            }
 
         bead_id = decision["bead_id"]
         answer = decision["option"]
-        self._log.info("Decision callback: %s answered '%s' by %s", bead_id, answer, from_user)
+        self._log.info(
+            "Decision callback: %s answered '%s' by %s", bead_id, answer, from_user
+        )
 
         # Remove all pending callbacks for this bead
         prefix = f"reactor_decide:{bead_id}:"
@@ -593,8 +676,11 @@ class ReactionDispatcher:
             del self._pending_decisions[k]
 
         return {
-            "ok": True, "bead_id": bead_id, "answer": answer,
-            "answered_by": from_user, "source_db": decision.get("source_db", ""),
+            "ok": True,
+            "bead_id": bead_id,
+            "answer": answer,
+            "answered_by": from_user,
+            "source_db": decision.get("source_db", ""),
         }
 
     # --- Action: irc ---
@@ -607,13 +693,16 @@ class ReactionDispatcher:
         channel = self._interpolate(action.get("channel", "#aegis"), event)
         text = self._interpolate(action.get("template", "{summary}"), event)
 
-        body = json.dumps({
-            "channel": channel,
-            "message": text,
-        }).encode("utf-8")
+        body = json.dumps(
+            {
+                "channel": channel,
+                "message": text,
+            }
+        ).encode("utf-8")
 
         req = urllib.request.Request(
-            bridge_url, data=body,
+            bridge_url,
+            data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -661,8 +750,13 @@ class ReactionDispatcher:
                 reaction.setdefault(field, event[field])
 
         self._timer_mgr.create_timer(subject_id, timer_type, delay, reaction)
-        self._log.info("Timer created: %s/%s fires in %ds for %s",
-                       timer_type, subject_id, delay, event.get("summary", "")[:60])
+        self._log.info(
+            "Timer created: %s/%s fires in %ds for %s",
+            timer_type,
+            subject_id,
+            delay,
+            event.get("summary", "")[:60],
+        )
 
     # --- Action: cancel-timer ---
 
@@ -694,14 +788,17 @@ class ReactionDispatcher:
             self._log.debug("gt-nudge: no target resolved, skipping")
             return
 
-        body = json.dumps({
-            "target": target,
-            "message": message,
-            "mode": mode,
-        }).encode("utf-8")
+        body = json.dumps(
+            {
+                "target": target,
+                "message": message,
+                "mode": mode,
+            }
+        ).encode("utf-8")
 
         req = urllib.request.Request(
-            f"{relay_url}/nudge", data=body,
+            f"{relay_url}/nudge",
+            data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -711,7 +808,9 @@ class ReactionDispatcher:
                 if result.get("ok"):
                     self._log.info("gt-nudge → %s: %s", target, message[:60])
                 else:
-                    self._log.error("gt-nudge %s failed: %s", target, result.get("stderr", "")[:100])
+                    self._log.error(
+                        "gt-nudge %s failed: %s", target, result.get("stderr", "")[:100]
+                    )
         except urllib.error.URLError as e:
             self._log.error("gt-nudge failed (target=%s): %s", target, e)
 
@@ -745,14 +844,19 @@ class ReactionDispatcher:
             next_level = current_level + 1
 
         if next_level >= len(chain):
-            self._log.info("alert-escalate: chain exhausted for %s (level %d/%d)",
-                           fingerprint, next_level, len(chain))
+            self._log.info(
+                "alert-escalate: chain exhausted for %s (level %d/%d)",
+                fingerprint,
+                next_level,
+                len(chain),
+            )
             return
 
         target = chain[next_level]
-        delay = action.get("delay_seconds",
-                           self._config.get("dispatch", {}).get(
-                               "escalation_timer_seconds", 600))
+        delay = action.get(
+            "delay_seconds",
+            self._config.get("dispatch", {}).get("escalation_timer_seconds", 600),
+        )
 
         # Build timer reaction payload with full context
         reaction = {
@@ -768,8 +872,13 @@ class ReactionDispatcher:
         }
 
         self._timer_mgr.create_timer(fingerprint, "alert_escalation", delay, reaction)
-        self._log.info("Escalation timer: %s level %d→%s in %ds",
-                       fingerprint, next_level, target, delay)
+        self._log.info(
+            "Escalation timer: %s level %d→%s in %ds",
+            fingerprint,
+            next_level,
+            target,
+            delay,
+        )
 
     # --- Action: webhook (generic) ---
 
@@ -780,13 +889,17 @@ class ReactionDispatcher:
         headers = action.get("headers", {})
         headers.setdefault("Content-Type", "application/json")
 
-        body = json.dumps({
-            "event_type": event["event_type"],
-            "subject_id": event.get("subject_id"),
-            "summary": event.get("summary"),
-            "timestamp": event.get("timestamp", datetime.datetime.utcnow().isoformat()),
-            "payload": event.get("payload"),
-        }).encode("utf-8")
+        body = json.dumps(
+            {
+                "event_type": event["event_type"],
+                "subject_id": event.get("subject_id"),
+                "summary": event.get("summary"),
+                "timestamp": event.get(
+                    "timestamp", datetime.datetime.utcnow().isoformat()
+                ),
+                "payload": event.get("payload"),
+            }
+        ).encode("utf-8")
 
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
@@ -807,7 +920,9 @@ class ReactionDispatcher:
                 cmd, shell=True, capture_output=True, text=True, timeout=timeout
             )
             if result.returncode != 0:
-                self._log.error("Shell command failed (rc=%d): %s", result.returncode, result.stderr)
+                self._log.error(
+                    "Shell command failed (rc=%d): %s", result.returncode, result.stderr
+                )
             else:
                 self._log.debug("Shell output: %s", result.stdout[:500])
         except subprocess.TimeoutExpired:
@@ -818,7 +933,9 @@ class ReactionDispatcher:
     def _action_log(self, action: dict, event: dict):
         """Log the event (useful for debugging)."""
         level = action.get("level", "info").upper()
-        message = self._interpolate(action.get("template", "{event_type}: {summary}"), event)
+        message = self._interpolate(
+            action.get("template", "{event_type}: {summary}"), event
+        )
         self._log.log(getattr(logging, level, logging.INFO), message)
 
     def _interpolate(self, template: str, event: dict) -> str:
@@ -855,10 +972,13 @@ class ReactionDispatcher:
 # Event writer — persists classified events to the reactor_events table
 # ---------------------------------------------------------------------------
 
+
 class EventWriter:
     """Writes classified events to the reactor_events Dolt table."""
 
-    def __init__(self, conn_settings: dict, database: str, table: str = "reactor_events"):
+    def __init__(
+        self, conn_settings: dict, database: str, table: str = "reactor_events"
+    ):
         self._conn_settings = conn_settings
         self._database = database
         self._table = table
@@ -905,10 +1025,13 @@ class EventWriter:
 # State tracker — persists GTID position for crash recovery
 # ---------------------------------------------------------------------------
 
+
 class StateTracker:
     """Persists reactor state (GTID position, etc.) to Dolt."""
 
-    def __init__(self, conn_settings: dict, database: str, table: str = "reactor_state"):
+    def __init__(
+        self, conn_settings: dict, database: str, table: str = "reactor_state"
+    ):
         self._conn_settings = conn_settings
         self._database = database
         self._table = table
@@ -963,6 +1086,7 @@ class StateTracker:
 # Health server — lightweight HTTP health check endpoint
 # ---------------------------------------------------------------------------
 
+
 class HealthServer:
     """HTTP server for health checks, status, and decision callbacks."""
 
@@ -1008,7 +1132,10 @@ class HealthServer:
                     if self.path == "/event":
                         _audit_event_request(
                             self.client_address[0] if self.client_address else "",
-                            self.path, None, "error:invalid-json")
+                            self.path,
+                            None,
+                            "error:invalid-json",
+                        )
                     self._respond(400, {"error": "invalid JSON"})
                     return
 
@@ -1023,8 +1150,10 @@ class HealthServer:
                     ok = bool(result.get("ok"))
                     _audit_event_request(
                         self.client_address[0] if self.client_address else "",
-                        self.path, data,
-                        "ok" if ok else "error:" + str(result.get("error", "?")))
+                        self.path,
+                        data,
+                        "ok" if ok else "error:" + str(result.get("error", "?")),
+                    )
                     self._respond(200 if ok else 400, result)
                 else:
                     self._respond(404, {"error": "not found"})
@@ -1044,7 +1173,9 @@ class HealthServer:
                 # Answer the callback query (remove "loading" spinner)
                 callback_id = callback_query.get("id")
                 if callback_id and result.get("ok"):
-                    reactor.answer_telegram_callback(callback_id, f"Decided: {result['answer']}")
+                    reactor.answer_telegram_callback(
+                        callback_id, f"Decided: {result['answer']}"
+                    )
 
                 self._respond(200, result)
 
@@ -1065,10 +1196,12 @@ class HealthServer:
             def _handle_telegram_webhook(self, data):
                 """Handle inbound Telegram messages via Bot API webhook."""
                 expected_secret = reactor._config.get("dispatch", {}).get(
-                    "telegram_webhook_secret", "")
+                    "telegram_webhook_secret", ""
+                )
                 if expected_secret:
                     header_secret = self.headers.get(
-                        "X-Telegram-Bot-Api-Secret-Token", "")
+                        "X-Telegram-Bot-Api-Secret-Token", ""
+                    )
                     if header_secret != expected_secret:
                         self._respond(403, {"ok": False, "error": "forbidden"})
                         return
@@ -1080,12 +1213,15 @@ class HealthServer:
                     return
 
                 chat_id = str(msg.get("chat", {}).get("id", ""))
-                expected_chat = str(reactor._config.get("dispatch", {}).get(
-                    "telegram_chat_id", ""))
+                expected_chat = str(
+                    reactor._config.get("dispatch", {}).get("telegram_chat_id", "")
+                )
                 if not expected_chat or chat_id != expected_chat:
                     reactor._log.warning(
                         "telegram webhook: ignored chat %s (expected %s)",
-                        chat_id, expected_chat)
+                        chat_id,
+                        expected_chat,
+                    )
                     return
 
                 text = msg.get("text", "").strip()
@@ -1102,15 +1238,19 @@ class HealthServer:
             def _handle_github_webhook(self, raw_body: bytes):
                 """Handle inbound GitHub webhook events."""
                 secret = reactor._config.get("dispatch", {}).get(
-                    "github_webhook_secret", "")
+                    "github_webhook_secret", ""
+                )
                 if secret:
                     sig_header = self.headers.get("X-Hub-Signature-256", "")
                     if not sig_header.startswith("sha256="):
                         self._respond(403, {"ok": False, "error": "forbidden"})
                         return
-                    expected = "sha256=" + hmac.new(
-                        secret.encode(), raw_body, hashlib.sha256
-                    ).hexdigest()
+                    expected = (
+                        "sha256="
+                        + hmac.new(
+                            secret.encode(), raw_body, hashlib.sha256
+                        ).hexdigest()
+                    )
                     if not hmac.compare_digest(sig_header, expected):
                         self._respond(403, {"ok": False, "error": "forbidden"})
                         return
@@ -1162,11 +1302,17 @@ class HealthServer:
 # Timer manager — handles delayed/scheduled reactions
 # ---------------------------------------------------------------------------
 
+
 class TimerManager:
     """Manages durable timers persisted to Dolt."""
 
-    def __init__(self, conn_settings: dict, database: str,
-                 table: str = "reactor_timers", dispatcher=None):
+    def __init__(
+        self,
+        conn_settings: dict,
+        database: str,
+        table: str = "reactor_timers",
+        dispatcher=None,
+    ):
         self._conn_settings = conn_settings
         self._database = database
         self._table = table
@@ -1184,8 +1330,9 @@ class TimerManager:
     def stop(self):
         self._running = False
 
-    def create_timer(self, subject_id: str, timer_type: str,
-                     delay_seconds: int, reaction: dict):
+    def create_timer(
+        self, subject_id: str, timer_type: str, delay_seconds: int, reaction: dict
+    ):
         """Create a new durable timer."""
         timer_id = ulid()
         fire_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=delay_seconds)
@@ -1198,11 +1345,19 @@ class TimerManager:
                     f"INSERT INTO {self._table} "
                     "(id, subject_id, timer_type, fire_at, reaction, created_at) "
                     "VALUES (%s, %s, %s, %s, %s, %s)",
-                    (timer_id, subject_id, timer_type, fire_at,
-                     json.dumps(reaction), now),
+                    (
+                        timer_id,
+                        subject_id,
+                        timer_type,
+                        fire_at,
+                        json.dumps(reaction),
+                        now,
+                    ),
                 )
             conn.commit()
-            self._log.info("Timer %s created: %s fires at %s", timer_id, timer_type, fire_at)
+            self._log.info(
+                "Timer %s created: %s fires at %s", timer_id, timer_type, fire_at
+            )
         finally:
             conn.close()
 
@@ -1240,19 +1395,27 @@ class TimerManager:
         conn = pymysql.connect(**self._conn_settings, database=self._database)
         try:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
-                cur.execute(
-                    f"SELECT * FROM {self._table} WHERE fire_at <= %s", (now,)
-                )
+                cur.execute(f"SELECT * FROM {self._table} WHERE fire_at <= %s", (now,))
                 timers = cur.fetchall()
 
             for timer in timers:
-                self._log.info("Timer fired: %s (%s) for %s",
-                               timer["id"], timer["timer_type"], timer["subject_id"])
-                reaction = json.loads(timer["reaction"]) if isinstance(timer["reaction"], str) else timer["reaction"]
+                self._log.info(
+                    "Timer fired: %s (%s) for %s",
+                    timer["id"],
+                    timer["timer_type"],
+                    timer["subject_id"],
+                )
+                reaction = (
+                    json.loads(timer["reaction"])
+                    if isinstance(timer["reaction"], str)
+                    else timer["reaction"]
+                )
 
                 if self._dispatcher:
                     event = {
-                        "event_type": reaction.get("event_type", f"timer.{timer['timer_type']}"),
+                        "event_type": reaction.get(
+                            "event_type", f"timer.{timer['timer_type']}"
+                        ),
                         "subject_id": timer["subject_id"],
                         "summary": f"Timer fired: {timer['timer_type']} for {timer['subject_id']}",
                         "payload": reaction,
@@ -1261,7 +1424,9 @@ class TimerManager:
 
                 # Delete fired timer
                 with conn.cursor() as cur:
-                    cur.execute(f"DELETE FROM {self._table} WHERE id = %s", (timer["id"],))
+                    cur.execute(
+                        f"DELETE FROM {self._table} WHERE id = %s", (timer["id"],)
+                    )
                 conn.commit()
         finally:
             conn.close()
@@ -1270,6 +1435,7 @@ class TimerManager:
 # ---------------------------------------------------------------------------
 # Reactor core — the main event loop
 # ---------------------------------------------------------------------------
+
 
 class Reactor:
     """Core reactor: binlog consumer → classifier → dispatcher pipeline."""
@@ -1301,7 +1467,9 @@ class Reactor:
         # Components
         self._schema = SchemaMapper(self._conn_settings)
         self._classifier = EventClassifier(config.get("classify", []), self._schema)
-        self._dispatcher = ReactionDispatcher(config.get("reactions", []), config, dry_run)
+        self._dispatcher = ReactionDispatcher(
+            config.get("reactions", []), config, dry_run
+        )
         self._writer = EventWriter(self._conn_settings, self._event_db)
         self._state = StateTracker(self._conn_settings, self._event_db)
         self._timer_mgr = TimerManager(
@@ -1328,7 +1496,9 @@ class Reactor:
         Falls back to poll mode if binlog is unavailable.
         """
         if BinLogStreamReader is None:
-            self._log.error("pymysqlreplication not installed — falling back to poll mode")
+            self._log.error(
+                "pymysqlreplication not installed — falling back to poll mode"
+            )
             self._mode = "poll"
             self._run_poll()
             return
@@ -1349,13 +1519,17 @@ class Reactor:
                 log_bin, server_uuid = cur.fetchone()
             conn.close()
         except Exception as e:
-            self._log.error("Failed to check binlog status: %s — falling back to poll", e)
+            self._log.error(
+                "Failed to check binlog status: %s — falling back to poll", e
+            )
             self._mode = "poll"
             self._run_poll()
             return
 
         if not log_bin:
-            self._log.error("Dolt binlog is OFF (@@log_bin=0) — falling back to poll mode")
+            self._log.error(
+                "Dolt binlog is OFF (@@log_bin=0) — falling back to poll mode"
+            )
             self._mode = "poll"
             self._run_poll()
             return
@@ -1368,7 +1542,9 @@ class Reactor:
             self._log.info("Resuming binlog from GTID position: %s", saved_gtid)
         else:
             if saved_gtid:
-                self._log.warning("Discarding invalid saved GTID '%s' — not UUID format", saved_gtid)
+                self._log.warning(
+                    "Discarding invalid saved GTID '%s' — not UUID format", saved_gtid
+                )
             # Start from current executed GTID set, or fall back to server UUID
             current_gtid = self._state.get_gtid_executed()
             if current_gtid and ":" in current_gtid:
@@ -1378,8 +1554,11 @@ class Reactor:
                 auto_position = f"{server_uuid}:1"
                 self._log.info("Starting binlog from server UUID: %s", server_uuid)
 
-        self._log.info("Starting reactor (binlog mode, server_id=%d, dry_run=%s)",
-                       server_id, self._dry_run)
+        self._log.info(
+            "Starting reactor (binlog mode, server_id=%d, dry_run=%s)",
+            server_id,
+            self._dry_run,
+        )
 
         stream = None
         events_since_save = 0
@@ -1397,7 +1576,11 @@ class Reactor:
                 if not self._running:
                     break
 
-                schema = event.schema.decode() if isinstance(event.schema, bytes) else event.schema
+                schema = (
+                    event.schema.decode()
+                    if isinstance(event.schema, bytes)
+                    else event.schema
+                )
                 table = event.table
 
                 if (schema, table) not in watched:
@@ -1408,7 +1591,9 @@ class Reactor:
                 if isinstance(event, WriteRowsEvent):
                     for row in event.rows:
                         values = self._row_to_dict(row["values"], columns)
-                        classified = self._classifier.classify_insert(schema, table, values)
+                        classified = self._classifier.classify_insert(
+                            schema, table, values
+                        )
                         if classified:
                             self._handle_classified_event(classified)
                         self._events_processed += 1
@@ -1417,7 +1602,9 @@ class Reactor:
                     for row in event.rows:
                         before = self._row_to_dict(row["before_values"], columns)
                         after = self._row_to_dict(row["after_values"], columns)
-                        classified = self._classifier.classify_update(schema, table, before, after)
+                        classified = self._classifier.classify_update(
+                            schema, table, before, after
+                        )
                         if classified:
                             self._handle_classified_event(classified)
                         self._events_processed += 1
@@ -1425,7 +1612,9 @@ class Reactor:
                 elif isinstance(event, DeleteRowsEvent):
                     for row in event.rows:
                         values = self._row_to_dict(row["values"], columns)
-                        classified = self._classifier.classify_delete(schema, table, values)
+                        classified = self._classifier.classify_delete(
+                            schema, table, values
+                        )
                         if classified:
                             self._handle_classified_event(classified)
                         self._events_processed += 1
@@ -1463,8 +1652,11 @@ class Reactor:
     def _run_poll(self):
         """Poll mode — query dolt_log + dolt_diff for changes."""
         poll_interval = self._config.get("reactor", {}).get("poll_interval", 3)
-        self._log.info("Starting reactor (poll mode, interval=%ds, dry_run=%s)",
-                       poll_interval, self._dry_run)
+        self._log.info(
+            "Starting reactor (poll mode, interval=%ds, dry_run=%s)",
+            poll_interval,
+            self._dry_run,
+        )
 
         # Get watched tables from classify config (database -> set of tables)
         self._watched_tables = {}
@@ -1482,11 +1674,18 @@ class Reactor:
                 break
             except Exception as e:
                 if attempt == max_retries:
-                    self._log.error("Dolt not ready after %d attempts, giving up: %s",
-                                    max_retries, e)
+                    self._log.error(
+                        "Dolt not ready after %d attempts, giving up: %s",
+                        max_retries,
+                        e,
+                    )
                     raise
-                self._log.warning("Dolt not ready (attempt %d/%d): %s — retrying in 5s",
-                                  attempt, max_retries, e)
+                self._log.warning(
+                    "Dolt not ready (attempt %d/%d): %s — retrying in 5s",
+                    attempt,
+                    max_retries,
+                    e,
+                )
                 time.sleep(5)
 
         # Initialize last-seen commit per database
@@ -1537,13 +1736,11 @@ class Reactor:
                         cur.execute(
                             f"SELECT * FROM `{table}` WHERE created_at > %s "
                             "ORDER BY created_at ASC LIMIT 50",
-                            (last_ts,)
+                            (last_ts,),
                         )
                     else:
                         # First run: just record the latest timestamp, don't process history
-                        cur.execute(
-                            f"SELECT MAX(created_at) as max_ts FROM `{table}`"
-                        )
+                        cur.execute(f"SELECT MAX(created_at) as max_ts FROM `{table}`")
                         row = cur.fetchone()
                         if row and row["max_ts"]:
                             self._state.set(ts_key, str(row["max_ts"]))
@@ -1556,8 +1753,9 @@ class Reactor:
                 if not new_rows:
                     continue
 
-                self._log.info("Direct poll: %d new row(s) in %s.%s",
-                               len(new_rows), db, table)
+                self._log.info(
+                    "Direct poll: %d new row(s) in %s.%s", len(new_rows), db, table
+                )
 
                 # Process each new row as an insert event
                 max_ts = last_ts
@@ -1626,15 +1824,19 @@ class Reactor:
                 cur.execute(
                     f"SELECT commit_hash, message, committer, date "
                     f"FROM dolt_log(%s) ORDER BY date ASC",
-                    (range_spec,)
+                    (range_spec,),
                 )
                 new_commits = cur.fetchall()
         except Exception as e:
             err_str = str(e)
             if "invalid ref spec" in err_str.lower() or "not found" in err_str.lower():
                 # Last commit no longer in history (database rebased/reset)
-                self._log.warning("Last commit %s not found in %s, skipping to HEAD %s",
-                                  last_commit[:12], database, head[:12])
+                self._log.warning(
+                    "Last commit %s not found in %s, skipping to HEAD %s",
+                    last_commit[:12],
+                    database,
+                    head[:12],
+                )
                 self._state.set(state_key, head)
                 return False
             self._log.error("Failed to query dolt_log for %s: %s", database, e)
@@ -1660,28 +1862,40 @@ class Reactor:
         if catchup:
             self._log.warning(
                 "Catchup mode: %d commits pending in %s, processing %d this cycle",
-                total_pending, database, max_per_cycle)
+                total_pending,
+                database,
+                max_per_cycle,
+            )
             new_commits = new_commits[:max_per_cycle]
             self._catchup_remaining = total_pending - max_per_cycle
         else:
             self._catchup_remaining = 0
 
-        self._log.info("Found %d new commit(s) in %s%s",
-                       len(new_commits), database,
-                       f" ({total_pending - len(new_commits)} deferred)" if catchup else "")
+        self._log.info(
+            "Found %d new commit(s) in %s%s",
+            len(new_commits),
+            database,
+            f" ({total_pending - len(new_commits)} deferred)" if catchup else "",
+        )
 
         # Process each new commit's diffs
         tables = self._watched_tables.get(database, set())
         prev_commit = last_commit
         for i, (commit_hash, message, committer, date) in enumerate(new_commits):
-            self._log.info("Processing commit %s: %s (by %s)",
-                           commit_hash[:12], message, committer)
+            self._log.info(
+                "Processing commit %s: %s (by %s)", commit_hash[:12], message, committer
+            )
             for table in tables:
                 try:
                     self._process_commit_diff(database, table, prev_commit, commit_hash)
                 except Exception as e:
-                    self._log.error("Error processing diff %s.%s@%s: %s",
-                                    database, table, commit_hash[:12], e)
+                    self._log.error(
+                        "Error processing diff %s.%s@%s: %s",
+                        database,
+                        table,
+                        commit_hash[:12],
+                        e,
+                    )
             prev_commit = commit_hash
 
             # Inter-commit delay during catchup to avoid overloading Dolt
@@ -1692,8 +1906,9 @@ class Reactor:
         self._state.set(state_key, prev_commit)
         return True
 
-    def _process_commit_diff(self, database: str, table: str,
-                             from_commit: str, to_commit: str):
+    def _process_commit_diff(
+        self, database: str, table: str, from_commit: str, to_commit: str
+    ):
         """Query dolt_diff for a table between two commits and process changes."""
         diff_table = f"dolt_diff_{table}"
         try:
@@ -1702,7 +1917,7 @@ class Reactor:
                 cur.execute(
                     f"SELECT * FROM `{diff_table}` "
                     "WHERE from_commit = %s AND to_commit = %s",
-                    (from_commit, to_commit)
+                    (from_commit, to_commit),
                 )
                 diffs = cur.fetchall()
         except Exception as e:
@@ -1724,7 +1939,10 @@ class Reactor:
             for col, val in diff_row.items():
                 if col.startswith("to_") and col not in ("to_commit", "to_commit_date"):
                     to_row[col[3:]] = val
-                elif col.startswith("from_") and col not in ("from_commit", "from_commit_date"):
+                elif col.startswith("from_") and col not in (
+                    "from_commit",
+                    "from_commit_date",
+                ):
                     from_row[col[5:]] = val
 
             if diff_type == "added":
@@ -1733,7 +1951,9 @@ class Reactor:
                     self._handle_classified_event(classified)
 
             elif diff_type == "modified":
-                classified = self._classifier.classify_update(database, table, from_row, to_row)
+                classified = self._classifier.classify_update(
+                    database, table, from_row, to_row
+                )
                 if classified:
                     self._handle_classified_event(classified)
 
@@ -1803,55 +2023,79 @@ class Reactor:
 
         if gh_event == "pull_request":
             if action in ("opened", "reopened"):
-                return (f"github.pr.{action}", subj,
-                        f"PR {action}: {repo}#{pr_number} {pr_title} by {sender}",
-                        pr_number)
+                return (
+                    f"github.pr.{action}",
+                    subj,
+                    f"PR {action}: {repo}#{pr_number} {pr_title} by {sender}",
+                    pr_number,
+                )
             if action == "closed":
                 merged = pr.get("merged", False)
                 tag = "merged" if merged else "closed"
-                return (f"github.pr.{tag}", subj,
-                        f"PR {tag}: {repo}#{pr_number} {pr_title}",
-                        pr_number)
+                return (
+                    f"github.pr.{tag}",
+                    subj,
+                    f"PR {tag}: {repo}#{pr_number} {pr_title}",
+                    pr_number,
+                )
             if action in ("ready_for_review", "converted_to_draft"):
-                return (f"github.pr.{action}", subj,
-                        f"PR {action}: {repo}#{pr_number} {pr_title}",
-                        pr_number)
+                return (
+                    f"github.pr.{action}",
+                    subj,
+                    f"PR {action}: {repo}#{pr_number} {pr_title}",
+                    pr_number,
+                )
             if action == "review_requested":
                 # Same github.review_requested type the Notifications poller
                 # emits via /event — one taxonomy regardless of transport.
                 author = pr.get("user", {}).get("login", sender)
                 who = f" by {author}" if author else ""
-                return ("github.review_requested", subj,
-                        f"Review requested: {repo}#{pr_number} {pr_title}{who}",
-                        pr_number)
+                return (
+                    "github.review_requested",
+                    subj,
+                    f"Review requested: {repo}#{pr_number} {pr_title}{who}",
+                    pr_number,
+                )
             return (None, None, None, None)
 
         if gh_event == "pull_request_review":
             state = data.get("review", {}).get("state", action)
             reviewer = data.get("review", {}).get("user", {}).get("login", sender)
-            return (f"github.review.{state}", subj,
-                    f"Review {state}: {repo}#{pr_number} by {reviewer}",
-                    pr_number)
+            return (
+                f"github.review.{state}",
+                subj,
+                f"Review {state}: {repo}#{pr_number} by {reviewer}",
+                pr_number,
+            )
 
         if gh_event == "issue_comment" or gh_event == "pull_request_review_comment":
             comment_body = data.get("comment", {}).get("body", "")[:120]
             commenter = data.get("comment", {}).get("user", {}).get("login", sender)
-            return ("github.comment", subj,
-                    f"Comment on {repo}#{pr_number} by {commenter}: {comment_body}",
-                    pr_number)
+            return (
+                "github.comment",
+                subj,
+                f"Comment on {repo}#{pr_number} by {commenter}: {comment_body}",
+                pr_number,
+            )
 
         if gh_event == "check_suite":
             conclusion = data.get("check_suite", {}).get("conclusion", action)
             if conclusion in ("failure", "timed_out"):
                 branch = data.get("check_suite", {}).get("head_branch", "?")
-                return ("github.ci.failure", f"{repo}/{branch}",
-                        f"CI failed: {repo} branch {branch} ({conclusion})",
-                        0)
+                return (
+                    "github.ci.failure",
+                    f"{repo}/{branch}",
+                    f"CI failed: {repo} branch {branch} ({conclusion})",
+                    0,
+                )
             if conclusion == "success":
                 branch = data.get("check_suite", {}).get("head_branch", "?")
-                return ("github.ci.success", f"{repo}/{branch}",
-                        f"CI passed: {repo} branch {branch}",
-                        0)
+                return (
+                    "github.ci.success",
+                    f"{repo}/{branch}",
+                    f"CI passed: {repo} branch {branch}",
+                    0,
+                )
             return (None, None, None, None)
 
         if gh_event == "workflow_run":
@@ -1859,9 +2103,12 @@ class Reactor:
             name = data.get("workflow_run", {}).get("name", "workflow")
             branch = data.get("workflow_run", {}).get("head_branch", "?")
             if conclusion in ("failure", "timed_out"):
-                return ("github.ci.failure", f"{repo}/{name}/{branch}",
-                        f"Workflow failed: {repo} {name} on {branch}",
-                        0)
+                return (
+                    "github.ci.failure",
+                    f"{repo}/{name}/{branch}",
+                    f"Workflow failed: {repo} {name} on {branch}",
+                    0,
+                )
             return (None, None, None, None)
 
         if gh_event == "status":
@@ -1869,20 +2116,24 @@ class Reactor:
             ctx = data.get("context", "")
             if state in ("failure", "error"):
                 sha_short = data.get("sha", "")[:8]
-                return ("github.ci.failure", f"{repo}/{ctx}",
-                        f"Status {state}: {repo} {ctx} @ {sha_short}",
-                        0)
+                return (
+                    "github.ci.failure",
+                    f"{repo}/{ctx}",
+                    f"Status {state}: {repo} {ctx} @ {sha_short}",
+                    0,
+                )
             return (None, None, None, None)
 
         if gh_event in ("label", "issues"):
-            return (f"github.{gh_event}.{action}",
-                    f"{repo}/{gh_event}",
-                    f"{gh_event} {action} on {repo} by {sender}",
-                    0)
+            return (
+                f"github.{gh_event}.{action}",
+                f"{repo}/{gh_event}",
+                f"{gh_event} {action} on {repo} by {sender}",
+                0,
+            )
 
         if gh_event == "ping":
-            self._log.info("GitHub webhook ping from %s: %s",
-                           repo, data.get("zen", ""))
+            self._log.info("GitHub webhook ping from %s: %s", repo, data.get("zen", ""))
             return (None, None, None, None)
 
         self._log.debug("Unhandled GitHub event: %s.%s from %s", gh_event, action, repo)
@@ -1937,10 +2188,12 @@ class Reactor:
         if len(self._recent_events) > 100:
             self._recent_events = self._recent_events[-100:]
 
-        self._log.info("Event: %s [%s] %s",
-                       event["event_type"],
-                       event.get("subject_id", "?"),
-                       event.get("summary", ""))
+        self._log.info(
+            "Event: %s [%s] %s",
+            event["event_type"],
+            event.get("subject_id", "?"),
+            event.get("summary", ""),
+        )
 
         # Write to event log table
         self._writer.write(event)
@@ -1955,8 +2208,11 @@ class Reactor:
         self._log.info("Shutting down reactor...")
         self._timer_mgr.stop()
         self._health.stop()
-        self._log.info("Reactor stopped. Processed %d events, dispatched %d.",
-                       self._events_processed, self._events_dispatched)
+        self._log.info(
+            "Reactor stopped. Processed %d events, dispatched %d.",
+            self._events_processed,
+            self._events_dispatched,
+        )
 
     # --- Status / metrics ---
 
@@ -1991,14 +2247,21 @@ class Reactor:
             bid = info["bead_id"]
             if bid not in seen:
                 seen.add(bid)
-                result.append({"bead_id": bid, "options": [], "message_id": info.get("message_id")})
+                result.append(
+                    {
+                        "bead_id": bid,
+                        "options": [],
+                        "message_id": info.get("message_id"),
+                    }
+                )
             for r in result:
                 if r["bead_id"] == bid:
                     r["options"].append(info["option"])
         return result
 
-    def handle_decision_callback(self, callback_data: str, from_user: str,
-                                  channel: str = "telegram") -> dict:
+    def handle_decision_callback(
+        self, callback_data: str, from_user: str, channel: str = "telegram"
+    ) -> dict:
         """Handle decision callback: dispatch state + persist to beads DB."""
         result = self._dispatcher.handle_telegram_callback(callback_data, from_user)
 
@@ -2013,11 +2276,16 @@ class Reactor:
                 prefix = f"reactor_decide:{bead_id}:"
                 for k in list(self._dispatcher._pending_decisions):
                     if k.startswith(prefix):
-                        source_db = self._dispatcher._pending_decisions[k].get("source_db", "")
+                        source_db = self._dispatcher._pending_decisions[k].get(
+                            "source_db", ""
+                        )
                         del self._dispatcher._pending_decisions[k]
                 result = {
-                    "ok": True, "bead_id": bead_id, "answer": answer,
-                    "answered_by": from_user, "source_db": source_db,
+                    "ok": True,
+                    "bead_id": bead_id,
+                    "answer": answer,
+                    "answered_by": from_user,
+                    "source_db": source_db,
                 }
 
         if result.get("ok"):
@@ -2038,7 +2306,9 @@ class Reactor:
                 conn = pymysql.connect(**self._conn_settings, database=db)
                 try:
                     with conn.cursor() as cur:
-                        cur.execute("SELECT 1 FROM issues WHERE id = %s LIMIT 1", (bead_id,))
+                        cur.execute(
+                            "SELECT 1 FROM issues WHERE id = %s LIMIT 1", (bead_id,)
+                        )
                         if cur.fetchone():
                             return db
                 finally:
@@ -2074,12 +2344,21 @@ class Reactor:
                     cur.execute(
                         "INSERT INTO events (issue_id, event_type, actor, comment, created_at) "
                         "VALUES (%s, %s, %s, %s, NOW())",
-                        (bead_id, "commented", "reactor",
-                         f"Decision: {answer} (by {answered_by} via {channel})"),
+                        (
+                            bead_id,
+                            "commented",
+                            "reactor",
+                            f"Decision: {answer} (by {answered_by} via {channel})",
+                        ),
                     )
                 conn.commit()
-                self._log.info("Persisted decision %s: '%s' by %s via %s",
-                               bead_id, answer, answered_by, channel)
+                self._log.info(
+                    "Persisted decision %s: '%s' by %s via %s",
+                    bead_id,
+                    answer,
+                    answered_by,
+                    channel,
+                )
             finally:
                 conn.close()
         except Exception as e:
@@ -2091,8 +2370,12 @@ class Reactor:
         if not token:
             return
         url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
-        body = json.dumps({"callback_query_id": callback_id, "text": text}).encode("utf-8")
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        body = json.dumps({"callback_query_id": callback_id, "text": text}).encode(
+            "utf-8"
+        )
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}
+        )
         try:
             urllib.request.urlopen(req, timeout=10)
         except Exception as e:
@@ -2104,14 +2387,28 @@ class Reactor:
         try:
             bd = os.path.expanduser("~/.local/bin/bd")
             result = subprocess.run(
-                [bd, "create", title, "-t", "task", "-l", "ask,from-telegram",
-                 "-d", f"From {from_user} via Telegram:\n\n{text}",
-                 "-a", "quarterdeck/crew/moneypenny"],
-                capture_output=True, text=True, timeout=15,
+                [
+                    bd,
+                    "create",
+                    title,
+                    "-t",
+                    "task",
+                    "-l",
+                    "ask,from-telegram",
+                    "-d",
+                    f"From {from_user} via Telegram:\n\n{text}",
+                    "-a",
+                    "quarterdeck/crew/moneypenny",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
                 cwd=os.path.expanduser("~/workspace/quarterdeck"),
             )
             if result.returncode == 0:
-                self._log.info("telegram ask-bead created: %s (from %s)", title, from_user)
+                self._log.info(
+                    "telegram ask-bead created: %s (from %s)", title, from_user
+                )
             else:
                 self._log.error("bd create failed: %s", result.stderr.strip())
         except Exception as e:
@@ -2134,11 +2431,22 @@ class Reactor:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Reactor — Real-time event processing for Dolt")
-    parser.add_argument("--config", required=True, help="Path to config file (TOML or JSON)")
-    parser.add_argument("--dry-run", action="store_true", help="Log events but don't execute reactions")
-    parser.add_argument("--log-level", default=None, help="Override log level (DEBUG, INFO, WARNING, ERROR)")
+    parser = argparse.ArgumentParser(
+        description="Reactor — Real-time event processing for Dolt"
+    )
+    parser.add_argument(
+        "--config", required=True, help="Path to config file (TOML or JSON)"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Log events but don't execute reactions"
+    )
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        help="Override log level (DEBUG, INFO, WARNING, ERROR)",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
