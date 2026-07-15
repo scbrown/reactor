@@ -383,7 +383,7 @@ class ReactionDispatcher:
     # beyond a notification: run a command, wake/act as an agent, or POST to an
     # arbitrary URL. These MUST NOT fire on externally-sourced events. See the
     # source_db capability gate in _execute_action (ss-u72jx L1 / ss-bjhyb H3).
-    PRIVILEGED_SINKS = frozenset({"shell", "gt-nudge", "webhook"})
+    PRIVILEGED_SINKS = frozenset({"shell", "gt-nudge", "gt-mail", "webhook"})
 
     def __init__(self, rules: list[dict], config: dict, dry_run: bool = False):
         self._rules = rules
@@ -463,6 +463,7 @@ class ReactionDispatcher:
                 "create-timer": self._action_create_timer,
                 "cancel-timer": self._action_cancel_timer,
                 "gt-nudge": self._action_gt_nudge,
+                "gt-mail": self._action_gt_mail,
                 "alert-escalate": self._action_alert_escalate,
             }.get(action_type)
 
@@ -813,6 +814,45 @@ class ReactionDispatcher:
                     )
         except urllib.error.URLError as e:
             self._log.error("gt-nudge failed (target=%s): %s", target, e)
+
+    # --- Action: gt-mail (safe argv wake — durable mail to a crew agent) ---
+
+    def _action_gt_mail(self, action: dict, event: dict):
+        """Send durable mail to a crew agent via `gt mail send` (safe argv — no shell=True).
+
+        The wake sink for the event-driven "Reactor wakes MP, replaces polling" direction
+        (ss-8q5dw / ss-u72jx). Replaces _action_gt_nudge, whose gt-relay endpoint is
+        unreachable from steve-dev (config.toml). Interpolated values become argv elements,
+        so there is no shell-injection surface. The free-text lives in the referenced bead,
+        NOT in this command — the mail is a pointer ("<id> needs routing — see the bead").
+        A PRIVILEGED sink: gated by source_db (externally-sourced events cannot wake crew).
+        """
+        target = self._interpolate(action.get("target", "{assignee}"), event)
+        subject = self._interpolate(
+            action.get("subject", "{event_type} {subject_id}"), event
+        )
+        message = self._interpolate(action.get("template", "{summary}"), event)
+        if not target or target.startswith("{"):
+            self._log.debug("gt-mail: no target resolved, skipping")
+            return
+        try:
+            result = subprocess.run(
+                ["gt", "mail", "send", target, "-s", subject, "-m", message],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode == 0:
+                self._log.info("gt-mail → %s: %s", target, subject[:60])
+            else:
+                self._log.error(
+                    "gt-mail %s failed (rc=%s): %s",
+                    target,
+                    result.returncode,
+                    result.stderr[:150],
+                )
+        except (subprocess.SubprocessError, OSError) as e:
+            self._log.error("gt-mail failed (target=%s): %s", target, e)
 
     # --- Action: alert-escalate (cascading escalation timers) ---
 

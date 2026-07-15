@@ -43,6 +43,12 @@ summary_template = "[{priority}] {title}"
 condition = "issue_type == 'decision'"
 event_type = "decision.created"
 
+# Overseer Deck quick-action → hitl-decision bead (ss-u72jx). issue_type is a
+# first-class column (reactor-legible); the decision type + note live on the bead.
+[[classify.sub_classify]]
+condition = "issue_type == 'hitl-decision'"
+event_type = "hitl_decision.created"
+
 [[classify.update_fields]]
 field = "status"
 default_event = "bead.status_changed"
@@ -121,6 +127,18 @@ event = "decision.created"
 actions = [
     { type = "irc", channel = "#bridge", template = "⚡ Decision needed: {title} ({id})" },
     { type = "telegram-decision", template = "⚡ Decision needed: {title} ({id})" },
+]
+
+# Overseer Deck action → WAKE Moneypenny to route it (ss-u72jx). MP is the router:
+# the mail is a pointer to the bead ({id}); the decision type + free-text note live on
+# the bead, NOT in this command. gt-mail is a PRIVILEGED sink → the source_db gate lets
+# it fire only for binlog-sourced (trusted) hitl-decision beads, never a forged /event.
+# NB: this reaction is dormant until the Deck /api/action producer lands (villiers, ss-1tyw4).
+[[reactions]]
+event = "hitl_decision.created"
+actions = [
+    { type = "gt-mail", target = "quarterdeck/crew/moneypenny", subject = "Deck action needs routing: {id}", template = "Steve took a Deck action on {id} ({title}). Route it — see the bead for the decision type + note." },
+    { type = "irc", channel = "#crew", template = "🎛️  Deck action → MP route: {title} ({id})" },
 ]
 
 # New mail → route to per-agent channel based on recipient
