@@ -79,6 +79,16 @@ def test_gt_nudge_allowed_on_binlog():
     assert _run("gt-nudge", "steve_scratchpad").call_count == 1
 
 
+def test_gt_mail_refused_on_external():
+    # gt-mail is the Deck-action wake sink — privileged, must not fire on forged /event
+    assert _run("gt-mail", "external").call_count == 0
+
+
+def test_gt_mail_allowed_on_binlog():
+    # binlog-sourced hitl-decision bead (trusted) → wake MP
+    assert _run("gt-mail", "steve_scratchpad").call_count == 1
+
+
 # ── non-privileged sinks: fire regardless of source ───────────────────────────
 
 
