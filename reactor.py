@@ -149,6 +149,26 @@ def apply_secret_env_overrides(config: dict) -> None:
             config.setdefault(section, {})[key] = val
 
 
+# Access/audit log for POST /event injections (ss-81rhd). The reactor host is
+# tailnet-only (SG blocks public) and all tailnet clients are trusted, so /event
+# is unauthenticated by design; observability — not auth — is the control. Every
+# request is logged with source IP, path, event_type, subject_id, and outcome.
+# Its own logger name makes the trail greppable: `grep reactor.event_audit`.
+_EVENT_AUDIT_LOG = logging.getLogger("reactor.event_audit")
+
+
+def _audit_event_request(client_ip, path, data, outcome):
+    """Emit one structured audit line for a POST /event request."""
+    _EVENT_AUDIT_LOG.info(
+        "source=%s path=%s event_type=%s subject_id=%s outcome=%s",
+        client_ip or "?",
+        path,
+        (data or {}).get("event_type", "?"),
+        (data or {}).get("subject_id", (data or {}).get("fingerprint", "?")),
+        outcome,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Schema mapper — resolves column indices to names for binlog events
 # ---------------------------------------------------------------------------
@@ -985,6 +1005,10 @@ class HealthServer:
                 try:
                     data = json.loads(body) if body else {}
                 except json.JSONDecodeError:
+                    if self.path == "/event":
+                        _audit_event_request(
+                            self.client_address[0] if self.client_address else "",
+                            self.path, None, "error:invalid-json")
                     self._respond(400, {"error": "invalid JSON"})
                     return
 
@@ -996,7 +1020,12 @@ class HealthServer:
                     self._handle_irc_callback(data)
                 elif self.path == "/event":
                     result = reactor.inject_external_event(data)
-                    self._respond(200 if result.get("ok") else 400, result)
+                    ok = bool(result.get("ok"))
+                    _audit_event_request(
+                        self.client_address[0] if self.client_address else "",
+                        self.path, data,
+                        "ok" if ok else "error:" + str(result.get("error", "?")))
+                    self._respond(200 if ok else 400, result)
                 else:
                     self._respond(404, {"error": "not found"})
 
